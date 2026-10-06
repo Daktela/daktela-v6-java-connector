@@ -134,7 +134,7 @@ class DaktelaConnectorTest {
         assertEquals(1, query.getFilters().size());
         DaktelaFilter filter = query.getFilters().get(0);
         assertTrue(filter.isOr());
-        assertEquals(2, filter.getOrFilters().size());
+        assertEquals(2, filter.getFilters().size());
     }
 
     @Test

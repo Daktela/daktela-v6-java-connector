@@ -1,6 +1,8 @@
 package com.daktela.connector;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.type.CollectionType;
 
 import java.util.Collections;
 import java.util.List;
@@ -8,6 +10,10 @@ import java.util.Map;
 
 /**
  * Immutable response wrapper for Daktela API responses.
+ * <p>
+ * For list endpoints {@link #getData()} holds the list of records and {@link #getTotal()} the
+ * total number of matching records. For single-record reads, creates and updates it holds the
+ * record itself.
  */
 public class DaktelaResponse {
 
@@ -37,18 +43,18 @@ public class DaktelaResponse {
     /**
      * Returns the raw data from the response.
      *
-     * @return data object (Map or List)
+     * @return data object (Map or List), or null if the response had no data
      */
     public Object getData() {
         return data;
     }
 
     /**
-     * Converts the data to the specified type using Jackson.
+     * Converts the data to the specified type using Jackson. Unknown properties are ignored.
      *
      * @param type the target class
      * @param <T>  the target type
-     * @return the converted data
+     * @return the converted data, or null if there is no data
      * @throws IllegalArgumentException if conversion fails
      */
     public <T> T getDataAs(Class<T> type) {
@@ -59,6 +65,46 @@ public class DaktelaResponse {
             return objectMapper.convertValue(data, type);
         } catch (IllegalArgumentException e) {
             throw new IllegalArgumentException("Failed to convert data to " + type.getName(), e);
+        }
+    }
+
+    /**
+     * Converts the data to a generic type using Jackson, e.g.
+     * {@code getDataAs(new TypeReference<List<Ticket>>() {})}.
+     *
+     * @param type the target type reference
+     * @param <T>  the target type
+     * @return the converted data, or null if there is no data
+     * @throws IllegalArgumentException if conversion fails
+     */
+    public <T> T getDataAs(TypeReference<T> type) {
+        if (data == null) {
+            return null;
+        }
+        try {
+            return objectMapper.convertValue(data, type);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("Failed to convert data to " + type.getType().getTypeName(), e);
+        }
+    }
+
+    /**
+     * Converts list data to a list of the specified element type.
+     *
+     * @param elementType the element class
+     * @param <T>         the element type
+     * @return the converted list, or an empty list if the data is not a list
+     * @throws IllegalArgumentException if conversion fails
+     */
+    public <T> List<T> getDataAsListOf(Class<T> elementType) {
+        if (!(data instanceof List)) {
+            return Collections.emptyList();
+        }
+        CollectionType listType = objectMapper.getTypeFactory().constructCollectionType(List.class, elementType);
+        try {
+            return objectMapper.convertValue(data, listType);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("Failed to convert data to List<" + elementType.getName() + ">", e);
         }
     }
 
@@ -91,10 +137,19 @@ public class DaktelaResponse {
     /**
      * Returns the total count of records (for paginated responses).
      *
-     * @return total count, or 0 if not available
+     * @return total count, or 0 if not available; use {@link #hasTotal()} to tell the difference
      */
     public int getTotal() {
         return total != null ? total : 0;
+    }
+
+    /**
+     * Returns whether the API reported a total count.
+     *
+     * @return true if {@link #getTotal()} is a real value
+     */
+    public boolean hasTotal() {
+        return total != null;
     }
 
     /**
@@ -107,7 +162,8 @@ public class DaktelaResponse {
     }
 
     /**
-     * Returns whether the response contains errors.
+     * Returns whether the response contains errors. A successful HTTP status can still carry
+     * application-level errors.
      *
      * @return true if there are errors
      */
@@ -126,9 +182,18 @@ public class DaktelaResponse {
 
     @Override
     public String toString() {
+        // Record data is deliberately omitted: it often contains personal data that must not end up in logs.
+        String dataSummary;
+        if (data instanceof List) {
+            dataSummary = "list(" + ((List<?>) data).size() + ")";
+        } else if (data instanceof Map) {
+            dataSummary = "record";
+        } else {
+            dataSummary = data == null ? "none" : data.getClass().getSimpleName();
+        }
         return "DaktelaResponse{" +
                 "status=" + status +
-                ", data=" + data +
+                ", data=" + dataSummary +
                 ", total=" + total +
                 ", errors=" + errors +
                 '}';

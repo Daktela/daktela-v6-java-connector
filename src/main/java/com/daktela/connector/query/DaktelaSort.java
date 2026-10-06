@@ -1,7 +1,8 @@
 package com.daktela.connector.query;
 
-import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Builder for Daktela API sort expressions.
@@ -18,7 +19,7 @@ public class DaktelaSort {
     private final String direction;
 
     private DaktelaSort(String field, String direction) {
-        this.field = field;
+        this.field = Objects.requireNonNull(field, "field is required");
         this.direction = direction;
     }
 
@@ -66,9 +67,14 @@ public class DaktelaSort {
      * @return map representation of the sort
      */
     public Map<String, String> toMap() {
-        Map<String, String> map = new HashMap<>();
+        Map<String, String> map = new LinkedHashMap<>();
         map.put("field", field);
         map.put("dir", direction);
         return map;
+    }
+
+    @Override
+    public String toString() {
+        return field + " " + direction;
     }
 }

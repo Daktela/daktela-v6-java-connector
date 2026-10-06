@@ -1,13 +1,20 @@
 package com.daktela.connector;
 
 import com.daktela.connector.exception.DaktelaException;
+import com.daktela.connector.exception.DaktelaForbiddenException;
 import com.daktela.connector.exception.DaktelaNotFoundException;
+import com.daktela.connector.exception.DaktelaRateLimitException;
 import com.daktela.connector.exception.DaktelaUnauthorizedException;
 import com.daktela.connector.query.DaktelaFilter;
 import com.daktela.connector.query.DaktelaQuery;
 import com.daktela.connector.query.DaktelaSort;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import com.fasterxml.jackson.datatype.jsr310.deser.LocalDateTimeDeserializer;
+import com.fasterxml.jackson.datatype.jsr310.ser.LocalDateTimeSerializer;
 
 import java.io.IOException;
 import java.net.URI;
@@ -17,14 +24,21 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
 /**
  * Main client for Daktela V6 REST API.
+ * <p>
+ * Instances are immutable and thread-safe; create one per Daktela instance and reuse it.
  * <p>
  * Example usage:
  * <pre>{@code
@@ -42,27 +56,39 @@ import java.util.Objects;
  */
 public class DaktelaConnector {
 
-    private static final String API_PATH = "/api/v6/";
-    private static final String DEFAULT_USER_AGENT = "DaktelaJavaConnector/1.0";
+    /** Date-time format used by the Daktela API. */
+    public static final DateTimeFormatter DATE_TIME_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
-    private final String instance;
+    private static final String API_PATH = "/api/v6/";
+    private static final String JSON_SUFFIX = ".json";
+    private static final int DEFAULT_PAGE_SIZE = 100;
+    private static final int MAX_PAGES = 10_000;
+    private static final int MAX_BODY_IN_MESSAGE = 500;
+    private static final Duration MAX_RETRY_DELAY = Duration.ofSeconds(60);
+    private static final Duration INITIAL_BACKOFF = Duration.ofMillis(500);
+
+    private final String baseUrl;
     private final String accessToken;
     private final Duration timeout;
     private final AuthMethod authMethod;
     private final String userAgent;
+    private final int maxRetries;
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
+    private final Sleeper sleeper;
 
     private DaktelaConnector(Builder builder) {
-        this.instance = builder.instance;
+        this.baseUrl = normalizeBaseUrl(builder.instance);
         this.accessToken = builder.accessToken;
         this.timeout = builder.timeout;
         this.authMethod = builder.authMethod;
         this.userAgent = builder.userAgent;
-        this.objectMapper = new ObjectMapper();
-        this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(this.timeout)
-                .build();
+        this.maxRetries = builder.maxRetries;
+        this.objectMapper = builder.objectMapper != null ? builder.objectMapper : defaultObjectMapper();
+        this.httpClient = builder.httpClient != null
+                ? builder.httpClient
+                : HttpClient.newBuilder().connectTimeout(this.timeout).build();
+        this.sleeper = builder.sleeper;
     }
 
     /**
@@ -89,14 +115,44 @@ public class DaktelaConnector {
      * Performs a GET request with query parameters.
      *
      * @param endpoint the API endpoint
-     * @param query    the query parameters
+     * @param query    the query parameters, may be null
      * @return the API response
      * @throws DaktelaException if the request fails
      */
     public DaktelaResponse get(String endpoint, DaktelaQuery query) {
-        String url = buildUrl(endpoint, query);
-        HttpRequest request = buildRequest(url, "GET", null);
-        return executeRequest(request);
+        return execute("GET", endpoint, query, null);
+    }
+
+    /**
+     * Reads all records matching the query, following pagination until every page is fetched.
+     * The query's {@code take} is used as the page size (default 100) and its {@code skip} as the
+     * starting offset.
+     *
+     * @param endpoint the list endpoint (e.g., "tickets")
+     * @param query    the query parameters, may be null
+     * @return all matching records
+     * @throws DaktelaException if any request fails
+     */
+    public List<Map<String, Object>> getAll(String endpoint, DaktelaQuery query) {
+        DaktelaQuery base = query != null ? query : DaktelaQuery.builder().build();
+        int pageSize = base.getTake() != null ? base.getTake() : DEFAULT_PAGE_SIZE;
+        int skip = base.getSkip() != null ? base.getSkip() : 0;
+        List<Map<String, Object>> records = new ArrayList<>();
+        for (int page = 0; page < MAX_PAGES; page++) {
+            DaktelaResponse response = get(endpoint, base.toBuilder().pagination(pageSize, skip).build());
+            if (!(response.getData() instanceof List)) {
+                return records;
+            }
+            List<Map<String, Object>> pageRecords = response.getDataAsList();
+            records.addAll(pageRecords);
+            skip += pageRecords.size();
+            boolean lastPage = pageRecords.size() < pageSize
+                    || (response.hasTotal() && skip >= response.getTotal());
+            if (lastPage) {
+                return records;
+            }
+        }
+        throw new DaktelaException("Pagination of '" + endpoint + "' exceeded " + MAX_PAGES + " pages");
     }
 
     /**
@@ -108,9 +164,7 @@ public class DaktelaConnector {
      * @throws DaktelaException if the request fails
      */
     public DaktelaResponse post(String endpoint, Map<String, Object> data) {
-        String url = buildUrl(endpoint, null);
-        HttpRequest request = buildRequest(url, "POST", data);
-        return executeRequest(request);
+        return execute("POST", endpoint, null, data);
     }
 
     /**
@@ -122,9 +176,7 @@ public class DaktelaConnector {
      * @throws DaktelaException if the request fails
      */
     public DaktelaResponse put(String endpoint, Map<String, Object> data) {
-        String url = buildUrl(endpoint, null);
-        HttpRequest request = buildRequest(url, "PUT", data);
-        return executeRequest(request);
+        return execute("PUT", endpoint, null, data);
     }
 
     /**
@@ -135,101 +187,193 @@ public class DaktelaConnector {
      * @throws DaktelaException if the request fails
      */
     public DaktelaResponse delete(String endpoint) {
-        String url = buildUrl(endpoint, null);
-        HttpRequest request = buildRequest(url, "DELETE", null);
-        return executeRequest(request);
+        return execute("DELETE", endpoint, null, null);
     }
 
-    private String buildUrl(String endpoint, DaktelaQuery query) {
-        StringBuilder url = new StringBuilder();
-        url.append("https://").append(instance).append(API_PATH);
-
-        // Remove leading slash if present
-        if (endpoint.startsWith("/")) {
-            endpoint = endpoint.substring(1);
+    private DaktelaResponse execute(String method, String endpoint, DaktelaQuery query, Map<String, Object> body) {
+        HttpRequest request = buildRequest(buildUrl(endpoint, query), method, body);
+        boolean idempotent = "GET".equals(method);
+        for (int attempt = 0; ; attempt++) {
+            boolean retriesLeft = attempt < maxRetries;
+            try {
+                return send(request);
+            } catch (DaktelaRateLimitException e) {
+                // A 429 means the request was not processed, so retrying is safe for every method.
+                Duration delay = e.getRetryAfter() != null ? e.getRetryAfter() : backoff(attempt);
+                if (!retriesLeft || delay.compareTo(MAX_RETRY_DELAY) > 0) {
+                    throw e;
+                }
+                sleep(delay);
+            } catch (DaktelaException e) {
+                if (!retriesLeft || !idempotent || !isTransient(e)) {
+                    throw e;
+                }
+                sleep(backoff(attempt));
+            }
         }
-        url.append(endpoint);
+    }
 
-        // Build query parameters
+    private static boolean isTransient(DaktelaException e) {
+        int status = e.getStatusCode();
+        return status == 502 || status == 503 || status == 504
+                || (status == 0 && e.getCause() instanceof IOException);
+    }
+
+    private static Duration backoff(int attempt) {
+        Duration delay = INITIAL_BACKOFF.multipliedBy(1L << Math.min(attempt, 10));
+        return delay.compareTo(MAX_RETRY_DELAY) > 0 ? MAX_RETRY_DELAY : delay;
+    }
+
+    private void sleep(Duration delay) {
+        try {
+            sleeper.sleep(delay);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new DaktelaException("Request interrupted", e);
+        }
+    }
+
+    String buildUrl(String endpoint, DaktelaQuery query) {
+        Objects.requireNonNull(endpoint, "endpoint is required");
+        StringBuilder url = new StringBuilder(baseUrl).append(API_PATH).append(encodePath(endpoint));
+
         List<String> params = new ArrayList<>();
-
-        // Add auth token as query param if using QUERY auth method
         if (authMethod == AuthMethod.QUERY) {
             params.add("accessToken=" + urlEncode(accessToken));
         }
 
         if (query != null) {
-            // Fields
-            if (!query.getFields().isEmpty()) {
-                for (int i = 0; i < query.getFields().size(); i++) {
-                    params.add("fields[" + i + "]=" + urlEncode(query.getFields().get(i)));
-                }
+            List<String> fields = query.getFields();
+            for (int i = 0; i < fields.size(); i++) {
+                addParam(params, "fields[" + i + "]", fields.get(i));
             }
 
-            // Filters
             if (!query.getFilters().isEmpty()) {
-                for (int i = 0; i < query.getFilters().size(); i++) {
-                    DaktelaFilter filter = query.getFilters().get(i);
-                    addFilterParams(params, filter, i);
-                }
+                addFilterGroup(params, "filter", "and", query.getFilters());
             }
 
-            // Sorts
-            if (!query.getSorts().isEmpty()) {
-                for (int i = 0; i < query.getSorts().size(); i++) {
-                    DaktelaSort sort = query.getSorts().get(i);
-                    params.add("sort[" + i + "][field]=" + urlEncode(sort.getField()));
-                    params.add("sort[" + i + "][dir]=" + urlEncode(sort.getDirection()));
-                }
+            List<DaktelaSort> sorts = query.getSorts();
+            for (int i = 0; i < sorts.size(); i++) {
+                addParam(params, "sort[" + i + "][field]", sorts.get(i).getField());
+                addParam(params, "sort[" + i + "][dir]", sorts.get(i).getDirection());
             }
 
-            // Pagination
             if (query.getTake() != null) {
                 params.add("take=" + query.getTake());
             }
             if (query.getSkip() != null) {
                 params.add("skip=" + query.getSkip());
             }
+
+            for (Map.Entry<String, String> param : query.getParams().entrySet()) {
+                addParam(params, param.getKey(), param.getValue());
+            }
         }
 
         if (!params.isEmpty()) {
-            url.append("?").append(String.join("&", params));
+            url.append('?').append(String.join("&", params));
         }
-
         return url.toString();
     }
 
-    private void addFilterParams(List<String> params, DaktelaFilter filter, int index) {
-        if (filter.isOr() && filter.getOrFilters() != null) {
-            List<DaktelaFilter> orFilters = filter.getOrFilters();
-            for (int j = 0; j < orFilters.size(); j++) {
-                DaktelaFilter f = orFilters.get(j);
-                String prefix = "filter[" + index + "][or][" + j + "]";
-                params.add(prefix + "[field]=" + urlEncode(f.getField()));
-                params.add(prefix + "[operator]=" + urlEncode(f.getOperator()));
-                addFilterValue(params, prefix, f.getValue());
-            }
-        } else {
-            String prefix = "filter[" + index + "]";
-            params.add(prefix + "[field]=" + urlEncode(filter.getField()));
-            params.add(prefix + "[operator]=" + urlEncode(filter.getOperator()));
-            addFilterValue(params, prefix, filter.getValue());
+    private void addFilterGroup(List<String> params, String prefix, String logic, List<DaktelaFilter> filters) {
+        // A query whose only filter is a group is sent as that group, not wrapped in an extra AND.
+        if (filters.size() == 1 && filters.get(0).isGroup()) {
+            DaktelaFilter group = filters.get(0);
+            addFilterGroup(params, prefix, group.getLogic(), group.getFilters());
+            return;
+        }
+        addParam(params, prefix + "[logic]", logic);
+        for (int i = 0; i < filters.size(); i++) {
+            addFilter(params, prefix + "[filters][" + i + "]", filters.get(i));
         }
     }
 
-    private void addFilterValue(List<String> params, String prefix, Object value) {
-        if (value instanceof List) {
-            List<?> list = (List<?>) value;
-            for (int i = 0; i < list.size(); i++) {
-                params.add(prefix + "[value][" + i + "]=" + urlEncode(String.valueOf(list.get(i))));
+    private void addFilter(List<String> params, String prefix, DaktelaFilter filter) {
+        if (filter.isGroup()) {
+            addParam(params, prefix + "[logic]", filter.getLogic());
+            List<DaktelaFilter> children = filter.getFilters();
+            for (int j = 0; j < children.size(); j++) {
+                addFilter(params, prefix + "[filters][" + j + "]", children.get(j));
             }
-        } else {
-            params.add(prefix + "[value]=" + urlEncode(String.valueOf(value)));
+            return;
+        }
+        addParam(params, prefix + "[field]", filter.getField());
+        addParam(params, prefix + "[operator]", filter.getOperator());
+        Object value = filter.getValue();
+        if (value instanceof Collection) {
+            int i = 0;
+            for (Object item : (Collection<?>) value) {
+                addParam(params, prefix + "[value][" + i++ + "]", formatValue(item));
+            }
+        } else if (value != null) {
+            addParam(params, prefix + "[value]", formatValue(value));
         }
     }
 
-    private String urlEncode(String value) {
+    private static String formatValue(Object value) {
+        if (value == null) {
+            return "";
+        }
+        if (value instanceof Boolean) {
+            return (Boolean) value ? "1" : "0";
+        }
+        if (value instanceof LocalDateTime) {
+            return DATE_TIME_FORMAT.format((LocalDateTime) value);
+        }
+        if (value instanceof LocalDate) {
+            return DateTimeFormatter.ISO_LOCAL_DATE.format((LocalDate) value);
+        }
+        if (value instanceof Enum) {
+            return ((Enum<?>) value).name();
+        }
+        return String.valueOf(value);
+    }
+
+    private static void addParam(List<String> params, String name, String value) {
+        params.add(urlEncode(name) + "=" + urlEncode(value));
+    }
+
+    private static String urlEncode(String value) {
         return URLEncoder.encode(value, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Encodes each path segment of an endpoint and appends the {@code .json} suffix the API uses.
+     */
+    static String encodePath(String endpoint) {
+        String path = endpoint.trim();
+        while (path.startsWith("/")) {
+            path = path.substring(1);
+        }
+        while (path.endsWith("/")) {
+            path = path.substring(0, path.length() - 1);
+        }
+        if (path.endsWith(JSON_SUFFIX)) {
+            path = path.substring(0, path.length() - JSON_SUFFIX.length());
+        }
+        if (path.isEmpty()) {
+            throw new IllegalArgumentException("endpoint must not be empty");
+        }
+        StringBuilder encoded = new StringBuilder();
+        for (String segment : path.split("/", -1)) {
+            if (segment.isEmpty() || segment.equals(".") || segment.equals("..")) {
+                throw new IllegalArgumentException("Invalid endpoint path: " + endpoint);
+            }
+            if (encoded.length() > 0) {
+                encoded.append('/');
+            }
+            encoded.append(encodePathSegment(segment));
+        }
+        return encoded.append(JSON_SUFFIX).toString();
+    }
+
+    private static String encodePathSegment(String segment) {
+        // URLEncoder does form encoding; path segments need %20 for spaces and keep '@' and ':' readable.
+        return URLEncoder.encode(segment, StandardCharsets.UTF_8)
+                .replace("+", "%20")
+                .replace("%40", "@")
+                .replace("%3A", ":");
     }
 
     private HttpRequest buildRequest(String url, String method, Map<String, Object> body) {
@@ -239,9 +383,10 @@ public class DaktelaConnector {
                 .header("Accept", "application/json")
                 .header("User-Agent", userAgent);
 
-        // Add auth header if using HEADER auth method
         if (authMethod == AuthMethod.HEADER) {
             builder.header("X-AUTH-TOKEN", accessToken);
+        } else if (authMethod == AuthMethod.BEARER) {
+            builder.header("Authorization", "Bearer " + accessToken);
         }
 
         if (body != null) {
@@ -259,80 +404,195 @@ public class DaktelaConnector {
         return builder.build();
     }
 
-    @SuppressWarnings("unchecked")
-    private DaktelaResponse executeRequest(HttpRequest request) {
+    private DaktelaResponse send(HttpRequest request) {
+        HttpResponse<String> response;
         try {
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-
-            int statusCode = response.statusCode();
-            Object data = null;
-            Integer total = null;
-            List<Object> errors = null;
-
-            String responseBody = response.body();
-            if (responseBody != null && !responseBody.isEmpty()) {
-                Map<String, Object> json = objectMapper.readValue(responseBody, Map.class);
-
-                // Extract result/data
-                if (json.containsKey("result")) {
-                    Object result = json.get("result");
-                    if (result instanceof Map) {
-                        Map<String, Object> resultMap = (Map<String, Object>) result;
-                        data = resultMap.get("data");
-                        if (resultMap.containsKey("total")) {
-                            total = ((Number) resultMap.get("total")).intValue();
-                        }
-                    } else {
-                        data = result;
-                    }
-                } else if (json.containsKey("data")) {
-                    data = json.get("data");
-                }
-
-                // Extract total if at top level
-                if (total == null && json.containsKey("total")) {
-                    total = ((Number) json.get("total")).intValue();
-                }
-
-                // Extract errors
-                if (json.containsKey("error")) {
-                    Object error = json.get("error");
-                    if (error instanceof List) {
-                        errors = (List<Object>) error;
-                    } else if (error != null) {
-                        errors = List.of(error);
-                    }
-                }
-                if (json.containsKey("errors")) {
-                    Object errorList = json.get("errors");
-                    if (errorList instanceof List) {
-                        errors = (List<Object>) errorList;
-                    }
-                }
-            }
-
-            // Throw appropriate exception for error status codes
-            if (statusCode == 401) {
-                throw new DaktelaUnauthorizedException("Unauthorized", errors);
-            }
-            if (statusCode == 404) {
-                throw new DaktelaNotFoundException("Not found", errors);
-            }
-            if (statusCode >= 400) {
-                String message = errors != null && !errors.isEmpty() ? errors.toString() : "Request failed";
-                throw new DaktelaException(message, statusCode, errors);
-            }
-
-            return new DaktelaResponse(statusCode, data, total, errors, objectMapper);
-
-        } catch (DaktelaException e) {
-            throw e;
+            response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
         } catch (IOException e) {
             throw new DaktelaException("Network error: " + e.getMessage(), e);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new DaktelaException("Request interrupted", e);
         }
+        return parseResponse(response.statusCode(), response.body(),
+                response.headers().firstValue("Retry-After").orElse(null));
+    }
+
+    DaktelaResponse parseResponse(int statusCode, String responseBody, String retryAfter) {
+        Object json = null;
+        DaktelaException parseError = null;
+        if (responseBody != null && !responseBody.isBlank()) {
+            try {
+                json = objectMapper.readValue(responseBody, Object.class);
+            } catch (JsonProcessingException e) {
+                parseError = new DaktelaException("Invalid JSON in API response (HTTP " + statusCode + "): "
+                        + abbreviate(responseBody), statusCode, null, responseBody, e);
+            }
+        }
+
+        Object data = null;
+        Integer total = null;
+        Object errorData = null;
+        List<Object> errors = null;
+
+        if (json instanceof Map) {
+            Map<?, ?> envelope = (Map<?, ?>) json;
+            Object result = envelope.get("result");
+            if (result instanceof Map && ((Map<?, ?>) result).get("data") != null) {
+                // List responses: {"result": {"data": [...], "total": N}}
+                Map<?, ?> resultMap = (Map<?, ?>) result;
+                data = resultMap.get("data");
+                total = toInteger(resultMap.get("total"));
+            } else if (envelope.containsKey("result")) {
+                // Single-record reads, creates and updates: {"result": {...record...}}
+                data = result;
+            } else if (envelope.containsKey("data")) {
+                data = envelope.get("data");
+            }
+            if (total == null) {
+                total = toInteger(envelope.get("total"));
+            }
+
+            errorData = envelope.containsKey("error") ? envelope.get("error") : envelope.get("errors");
+            errors = toErrorList(errorData);
+        } else if (json != null) {
+            data = json;
+        }
+
+        if (statusCode >= 400) {
+            throw errorFor(statusCode, errorData, errors, responseBody, retryAfter);
+        }
+        if (parseError != null) {
+            throw parseError;
+        }
+        return new DaktelaResponse(statusCode, data, total, errors, objectMapper);
+    }
+
+    private static DaktelaException errorFor(int statusCode, Object errorData, List<Object> errors,
+                                             String responseBody, String retryAfter) {
+        String detail = errors != null && !errors.isEmpty()
+                ? errors.toString()
+                : (responseBody == null || responseBody.isBlank() ? null : abbreviate(responseBody));
+        switch (statusCode) {
+            case 401:
+                return new DaktelaUnauthorizedException(message("Unauthorized", statusCode, detail),
+                        errorData, responseBody);
+            case 403:
+                return new DaktelaForbiddenException(message("Forbidden", statusCode, detail),
+                        errorData, responseBody);
+            case 404:
+                return new DaktelaNotFoundException(message("Not found", statusCode, detail),
+                        errorData, responseBody);
+            case 429:
+                return new DaktelaRateLimitException(message("Rate limit exceeded", statusCode, detail),
+                        parseRetryAfter(retryAfter), errorData, responseBody);
+            default:
+                return new DaktelaException(message("Request failed", statusCode, detail),
+                        statusCode, errorData, responseBody, null);
+        }
+    }
+
+    private static String message(String summary, int statusCode, String detail) {
+        return summary + " (HTTP " + statusCode + ")" + (detail != null ? ": " + detail : "");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<Object> toErrorList(Object errorData) {
+        if (errorData == null) {
+            return null;
+        }
+        if (errorData instanceof List) {
+            return (List<Object>) errorData;
+        }
+        if (errorData instanceof Map && ((Map<?, ?>) errorData).isEmpty()) {
+            return null;
+        }
+        if (errorData instanceof String && ((String) errorData).isEmpty()) {
+            return null;
+        }
+        return List.of(errorData);
+    }
+
+    private static Integer toInteger(Object value) {
+        if (value instanceof Number) {
+            return ((Number) value).intValue();
+        }
+        if (value instanceof String) {
+            try {
+                return Integer.valueOf(((String) value).trim());
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    static Duration parseRetryAfter(String retryAfter) {
+        if (retryAfter == null || retryAfter.isBlank()) {
+            return null;
+        }
+        String value = retryAfter.trim();
+        try {
+            return Duration.ofSeconds(Math.max(0, Long.parseLong(value)));
+        } catch (NumberFormatException ignored) {
+            // Not delta-seconds; try the HTTP-date form.
+        }
+        try {
+            Duration delay = Duration.between(ZonedDateTime.now(),
+                    ZonedDateTime.parse(value, DateTimeFormatter.RFC_1123_DATE_TIME));
+            return delay.isNegative() ? Duration.ZERO : delay;
+        } catch (DateTimeParseException e) {
+            return null;
+        }
+    }
+
+    private static String abbreviate(String text) {
+        String trimmed = text.strip();
+        return trimmed.length() <= MAX_BODY_IN_MESSAGE ? trimmed : trimmed.substring(0, MAX_BODY_IN_MESSAGE) + "...";
+    }
+
+    static String normalizeBaseUrl(String instance) {
+        String value = instance.trim();
+        while (value.endsWith("/")) {
+            value = value.substring(0, value.length() - 1);
+        }
+        if (value.endsWith("/api/v6")) {
+            value = value.substring(0, value.length() - "/api/v6".length());
+        }
+        String lower = value.toLowerCase();
+        if (!lower.startsWith("https://") && !lower.startsWith("http://")) {
+            value = "https://" + value;
+        }
+        URI uri;
+        try {
+            uri = URI.create(value);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("Invalid instance: " + instance, e);
+        }
+        if (uri.getHost() == null) {
+            throw new IllegalArgumentException("Invalid instance: " + instance);
+        }
+        return value;
+    }
+
+    static ObjectMapper defaultObjectMapper() {
+        JavaTimeModule timeModule = new JavaTimeModule();
+        timeModule.addSerializer(LocalDateTime.class, new LocalDateTimeSerializer(DATE_TIME_FORMAT));
+        timeModule.addDeserializer(LocalDateTime.class, new LocalDateTimeDeserializer(DATE_TIME_FORMAT));
+        return new ObjectMapper()
+                .registerModule(timeModule)
+                .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+                .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+    }
+
+    private static String defaultUserAgent() {
+        String version = DaktelaConnector.class.getPackage().getImplementationVersion();
+        return "DaktelaJavaConnector/" + (version != null ? version : "dev");
+    }
+
+    /** Pauses between retries; replaceable in tests. */
+    interface Sleeper {
+        void sleep(Duration duration) throws InterruptedException;
     }
 
     /**
@@ -343,15 +603,20 @@ public class DaktelaConnector {
         private String accessToken;
         private Duration timeout = Duration.ofSeconds(30);
         private AuthMethod authMethod = AuthMethod.HEADER;
-        private String userAgent = DEFAULT_USER_AGENT;
+        private String userAgent = defaultUserAgent();
+        private int maxRetries = 0;
+        private HttpClient httpClient;
+        private ObjectMapper objectMapper;
+        private Sleeper sleeper = duration -> Thread.sleep(duration.toMillis());
 
         private Builder() {
         }
 
         /**
-         * Sets the Daktela instance hostname.
+         * Sets the Daktela instance. Accepts a hostname ({@code "my.daktela.com"}) or a base URL
+         * ({@code "https://my.daktela.com"}); {@code https://} is assumed when no scheme is given.
          *
-         * @param instance the instance hostname (e.g., "my.daktela.com")
+         * @param instance the instance hostname or base URL
          * @return this builder
          */
         public Builder instance(String instance) {
@@ -371,9 +636,9 @@ public class DaktelaConnector {
         }
 
         /**
-         * Sets the request timeout.
+         * Sets the connect and request timeout.
          *
-         * @param timeout the timeout duration
+         * @param timeout the timeout duration, must be positive
          * @return this builder
          */
         public Builder timeout(Duration timeout) {
@@ -383,8 +648,11 @@ public class DaktelaConnector {
 
         /**
          * Sets the authentication method.
+         * <p>
+         * Prefer a header-based method: with {@link AuthMethod#QUERY} the token becomes part of
+         * every URL and can end up in proxy and server access logs.
          *
-         * @param authMethod HEADER or QUERY
+         * @param authMethod HEADER (default), BEARER or QUERY
          * @return this builder
          */
         public Builder authMethod(AuthMethod authMethod) {
@@ -404,14 +672,75 @@ public class DaktelaConnector {
         }
 
         /**
+         * Sets how many times a failed request is retried (default 0, no retries).
+         * <p>
+         * Rate-limited requests (HTTP 429) are retried for every method, honouring
+         * {@code Retry-After}. Network errors and HTTP 502/503/504 are retried for GET only,
+         * because other methods may already have taken effect. Delays grow exponentially from 500 ms.
+         *
+         * @param maxRetries number of retries, must not be negative
+         * @return this builder
+         */
+        public Builder maxRetries(int maxRetries) {
+            this.maxRetries = maxRetries;
+            return this;
+        }
+
+        /**
+         * Uses a custom {@link HttpClient}, for example to configure a proxy or TLS settings.
+         * The connector's timeout is still applied per request.
+         *
+         * @param httpClient the HTTP client
+         * @return this builder
+         */
+        public Builder httpClient(HttpClient httpClient) {
+            this.httpClient = httpClient;
+            return this;
+        }
+
+        /**
+         * Uses a custom Jackson {@link ObjectMapper} for request bodies and
+         * {@link DaktelaResponse#getDataAs(Class)} conversions. By default unknown properties are
+         * ignored and {@code java.time} types use the API's {@code yyyy-MM-dd HH:mm:ss} format.
+         *
+         * @param objectMapper the object mapper
+         * @return this builder
+         */
+        public Builder objectMapper(ObjectMapper objectMapper) {
+            this.objectMapper = objectMapper;
+            return this;
+        }
+
+        Builder sleeper(Sleeper sleeper) {
+            this.sleeper = sleeper;
+            return this;
+        }
+
+        /**
          * Builds the connector.
          *
          * @return a new DaktelaConnector instance
-         * @throws NullPointerException if required fields are missing
+         * @throws NullPointerException     if required fields are missing
+         * @throws IllegalArgumentException if a setting is invalid
          */
         public DaktelaConnector build() {
             Objects.requireNonNull(instance, "instance is required");
             Objects.requireNonNull(accessToken, "accessToken is required");
+            Objects.requireNonNull(timeout, "timeout is required");
+            Objects.requireNonNull(authMethod, "authMethod is required");
+            Objects.requireNonNull(userAgent, "userAgent is required");
+            if (instance.isBlank()) {
+                throw new IllegalArgumentException("instance must not be blank");
+            }
+            if (accessToken.isBlank()) {
+                throw new IllegalArgumentException("accessToken must not be blank");
+            }
+            if (timeout.isZero() || timeout.isNegative()) {
+                throw new IllegalArgumentException("timeout must be positive");
+            }
+            if (maxRetries < 0) {
+                throw new IllegalArgumentException("maxRetries must not be negative");
+            }
             return new DaktelaConnector(this);
         }
     }

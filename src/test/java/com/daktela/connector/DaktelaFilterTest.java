@@ -100,7 +100,7 @@ class DaktelaFilterTest {
         DaktelaFilter filter = DaktelaFilter.notIn("stage", values);
 
         assertEquals("stage", filter.getField());
-        assertEquals("nin", filter.getOperator());
+        assertEquals("notin", filter.getOperator());
         assertEquals(values, filter.getValue());
     }
 
@@ -109,7 +109,7 @@ class DaktelaFilterTest {
         DaktelaFilter filter = DaktelaFilter.notIn("stage", "CLOSED", "ARCHIVED");
 
         assertEquals("stage", filter.getField());
-        assertEquals("nin", filter.getOperator());
+        assertEquals("notin", filter.getOperator());
         assertEquals(Arrays.asList("CLOSED", "ARCHIVED"), filter.getValue());
     }
 
@@ -123,8 +123,8 @@ class DaktelaFilterTest {
         assertNull(orFilter.getField());
         assertNull(orFilter.getOperator());
         assertNull(orFilter.getValue());
-        assertNotNull(orFilter.getOrFilters());
-        assertEquals(2, orFilter.getOrFilters().size());
+        assertNotNull(orFilter.getFilters());
+        assertEquals(2, orFilter.getFilters().size());
     }
 
     @Test
@@ -137,7 +137,7 @@ class DaktelaFilterTest {
         DaktelaFilter orFilter = DaktelaFilter.or(filters);
 
         assertTrue(orFilter.isOr());
-        assertEquals(3, orFilter.getOrFilters().size());
+        assertEquals(3, orFilter.getFilters().size());
     }
 
     @Test
@@ -158,12 +158,63 @@ class DaktelaFilterTest {
         );
         Map<String, Object> map = orFilter.toMap();
 
-        assertTrue(map.containsKey("or"));
+        assertEquals("or", map.get("logic"));
         @SuppressWarnings("unchecked")
-        List<Map<String, Object>> orList = (List<Map<String, Object>>) map.get("or");
-        assertEquals(2, orList.size());
-        assertEquals("stage", orList.get(0).get("field"));
-        assertEquals("eq", orList.get(0).get("operator"));
-        assertEquals("OPEN", orList.get(0).get("value"));
+        List<Map<String, Object>> filters = (List<Map<String, Object>>) map.get("filters");
+        assertEquals(2, filters.size());
+        assertEquals("stage", filters.get(0).get("field"));
+        assertEquals("eq", filters.get(0).get("operator"));
+        assertEquals("OPEN", filters.get(0).get("value"));
+    }
+
+    @Test
+    void testValueLessOperatorsOmitValue() {
+        assertEquals(Map.of("field", "user", "operator", "isnull"), DaktelaFilter.isNull("user").toMap());
+        assertEquals("isnotnull", DaktelaFilter.isNotNull("user").getOperator());
+    }
+
+    @Test
+    void testStringMatchOperators() {
+        assertEquals("contains", DaktelaFilter.contains("title", "x").getOperator());
+        assertEquals("doesnotcontain", DaktelaFilter.doesNotContain("title", "x").getOperator());
+        assertEquals("startswith", DaktelaFilter.startsWith("title", "x").getOperator());
+        assertEquals("endswith", DaktelaFilter.endsWith("title", "x").getOperator());
+        assertEquals("notlike", DaktelaFilter.notLike("title", "%x%").getOperator());
+    }
+
+    @Test
+    void testBetween() {
+        DaktelaFilter filter = DaktelaFilter.between("created", "2024-01-01", "2024-12-31");
+
+        assertEquals("between", filter.getOperator());
+        assertEquals(Arrays.asList("2024-01-01", "2024-12-31"), filter.getValue());
+    }
+
+    @Test
+    void testCustomOperatorCopiesCollections() {
+        List<String> values = new java.util.ArrayList<>(List.of("a"));
+        DaktelaFilter filter = DaktelaFilter.of("name", "in", values);
+        values.add("b");
+
+        assertEquals(List.of("a"), filter.getValue());
+    }
+
+    @Test
+    void testNullFieldIsRejected() {
+        assertThrows(NullPointerException.class, () -> DaktelaFilter.eq(null, "x"));
+    }
+
+    @Test
+    void testEmptyGroupIsRejected() {
+        assertThrows(IllegalArgumentException.class, () -> DaktelaFilter.or());
+    }
+
+    @Test
+    void testInFilterIsDefensivelyCopied() {
+        Object[] values = {"a", "b"};
+        DaktelaFilter filter = DaktelaFilter.in("stage", values);
+        values[0] = "changed";
+
+        assertEquals(Arrays.asList("a", "b"), filter.getValue());
     }
 }

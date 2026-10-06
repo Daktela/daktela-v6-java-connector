@@ -127,7 +127,7 @@ public class BasicUsageExample {
         // Using LIKE filter
         DaktelaResponse response4 = connector.get("tickets",
                 DaktelaQuery.builder()
-                        .filter(DaktelaFilter.like("title", "urgent"))
+                        .filter(DaktelaFilter.contains("title", "urgent"))
                         .build());
         System.out.println("Urgent tickets: " + response4.getTotal());
 

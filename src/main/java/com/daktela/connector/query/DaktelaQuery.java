@@ -3,7 +3,10 @@ package com.daktela.connector.query;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 
 /**
  * Combined query builder for Daktela API requests.
@@ -26,6 +29,7 @@ public class DaktelaQuery {
     private final List<DaktelaSort> sorts;
     private final Integer take;
     private final Integer skip;
+    private final Map<String, String> params;
 
     private DaktelaQuery(Builder builder) {
         this.fields = Collections.unmodifiableList(new ArrayList<>(builder.fields));
@@ -33,6 +37,7 @@ public class DaktelaQuery {
         this.sorts = Collections.unmodifiableList(new ArrayList<>(builder.sorts));
         this.take = builder.take;
         this.skip = builder.skip;
+        this.params = Collections.unmodifiableMap(new LinkedHashMap<>(builder.params));
     }
 
     /**
@@ -45,6 +50,22 @@ public class DaktelaQuery {
     }
 
     /**
+     * Creates a builder pre-populated with this query's settings.
+     *
+     * @return a new builder instance
+     */
+    public Builder toBuilder() {
+        Builder builder = new Builder();
+        builder.fields.addAll(fields);
+        builder.filters.addAll(filters);
+        builder.sorts.addAll(sorts);
+        builder.take = take;
+        builder.skip = skip;
+        builder.params.putAll(params);
+        return builder;
+    }
+
+    /**
      * Returns the list of fields to retrieve.
      *
      * @return unmodifiable list of field names
@@ -54,7 +75,7 @@ public class DaktelaQuery {
     }
 
     /**
-     * Returns the list of filters.
+     * Returns the list of filters. Top-level filters are combined with AND.
      *
      * @return unmodifiable list of filters
      */
@@ -90,12 +111,22 @@ public class DaktelaQuery {
     }
 
     /**
+     * Returns additional raw query parameters.
+     *
+     * @return unmodifiable map of parameter names to values
+     */
+    public Map<String, String> getParams() {
+        return params;
+    }
+
+    /**
      * Builder for DaktelaQuery.
      */
     public static class Builder {
         private final List<String> fields = new ArrayList<>();
         private final List<DaktelaFilter> filters = new ArrayList<>();
         private final List<DaktelaSort> sorts = new ArrayList<>();
+        private final Map<String, String> params = new LinkedHashMap<>();
         private Integer take;
         private Integer skip;
 
@@ -109,8 +140,7 @@ public class DaktelaQuery {
          * @return this builder
          */
         public Builder fields(String... fieldNames) {
-            this.fields.addAll(Arrays.asList(fieldNames));
-            return this;
+            return fields(Arrays.asList(fieldNames));
         }
 
         /**
@@ -120,18 +150,20 @@ public class DaktelaQuery {
          * @return this builder
          */
         public Builder fields(List<String> fieldNames) {
-            this.fields.addAll(fieldNames);
+            for (String fieldName : fieldNames) {
+                this.fields.add(Objects.requireNonNull(fieldName, "field name must not be null"));
+            }
             return this;
         }
 
         /**
-         * Adds a filter.
+         * Adds a filter. Top-level filters are combined with AND.
          *
          * @param filter the filter to add
          * @return this builder
          */
         public Builder filter(DaktelaFilter filter) {
-            this.filters.add(filter);
+            this.filters.add(Objects.requireNonNull(filter, "filter must not be null"));
             return this;
         }
 
@@ -142,8 +174,7 @@ public class DaktelaQuery {
          * @return this builder
          */
         public Builder filters(DaktelaFilter... filters) {
-            this.filters.addAll(Arrays.asList(filters));
-            return this;
+            return filters(Arrays.asList(filters));
         }
 
         /**
@@ -153,7 +184,9 @@ public class DaktelaQuery {
          * @return this builder
          */
         public Builder filters(List<DaktelaFilter> filters) {
-            this.filters.addAll(filters);
+            for (DaktelaFilter filter : filters) {
+                filter(filter);
+            }
             return this;
         }
 
@@ -164,7 +197,7 @@ public class DaktelaQuery {
          * @return this builder
          */
         public Builder sort(DaktelaSort sort) {
-            this.sorts.add(sort);
+            this.sorts.add(Objects.requireNonNull(sort, "sort must not be null"));
             return this;
         }
 
@@ -175,8 +208,7 @@ public class DaktelaQuery {
          * @return this builder
          */
         public Builder sorts(DaktelaSort... sorts) {
-            this.sorts.addAll(Arrays.asList(sorts));
-            return this;
+            return sorts(Arrays.asList(sorts));
         }
 
         /**
@@ -186,7 +218,9 @@ public class DaktelaQuery {
          * @return this builder
          */
         public Builder sorts(List<DaktelaSort> sorts) {
-            this.sorts.addAll(sorts);
+            for (DaktelaSort sort : sorts) {
+                sort(sort);
+            }
             return this;
         }
 
@@ -198,18 +232,19 @@ public class DaktelaQuery {
          * @return this builder
          */
         public Builder pagination(int take, int skip) {
-            this.take = take;
-            this.skip = skip;
-            return this;
+            return take(take).skip(skip);
         }
 
         /**
          * Sets the take (limit) value.
          *
-         * @param take number of records to retrieve
+         * @param take number of records to retrieve, must be positive
          * @return this builder
          */
         public Builder take(int take) {
+            if (take <= 0) {
+                throw new IllegalArgumentException("take must be positive");
+            }
             this.take = take;
             return this;
         }
@@ -217,11 +252,28 @@ public class DaktelaQuery {
         /**
          * Sets the skip (offset) value.
          *
-         * @param skip number of records to skip
+         * @param skip number of records to skip, must not be negative
          * @return this builder
          */
         public Builder skip(int skip) {
+            if (skip < 0) {
+                throw new IllegalArgumentException("skip must not be negative");
+            }
             this.skip = skip;
+            return this;
+        }
+
+        /**
+         * Adds a raw query parameter, for API options not covered by this builder.
+         * The name and value are URL-encoded when the request is sent.
+         *
+         * @param name  the parameter name
+         * @param value the parameter value
+         * @return this builder
+         */
+        public Builder param(String name, String value) {
+            this.params.put(Objects.requireNonNull(name, "name must not be null"),
+                    Objects.requireNonNull(value, "value must not be null"));
             return this;
         }
 
