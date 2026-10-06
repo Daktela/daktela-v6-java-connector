@@ -1,12 +1,26 @@
 name: Release
 
 # Pushing a tag vX.Y.Z (matching the pom version) tests, signs and publishes to Maven Central,
-# then creates the GitHub release from the CHANGELOG. Run manually for a dry run that tests,
-# signs and checks the Central token without publishing.
+# then creates the GitHub release from the CHANGELOG.
+#
+# Run manually (on main) for:
+# - a dry run of main: leave "tag" empty;
+# - a dry run of an existing tag: set "tag", leave "publish" unticked;
+# - publishing an existing tag that was never published (e.g. one created before this
+#   workflow existed): set "tag" and tick "publish".
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build, e.g. v1.1.0 (empty = main)'
+        required: false
+        default: ''
+      publish:
+        description: 'Publish the tag to Maven Central (cannot be undone)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -19,10 +33,39 @@ jobs:
   publish:
     name: Publish to Maven Central
     runs-on: ubuntu-latest
-    # Secrets live in this environment, which only accepts v* tags and main (for dry runs).
+    # Secrets live in this environment, which only accepts v* tags and main.
     environment: maven-central
+    outputs:
+      tag: ${{ steps.mode.outputs.tag }}
+      publish: ${{ steps.mode.outputs.publish }}
     steps:
+      - name: Decide what to build
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+        run: |
+          if [ "$EVENT" = "push" ]; then
+            tag="$GITHUB_REF_NAME"; publish=true
+          else
+            tag="$INPUT_TAG"; publish="$INPUT_PUBLISH"
+          fi
+          if [ -n "$tag" ] && ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'$tag' is not a release tag like v1.2.3"
+            exit 1
+          fi
+          if [ "$publish" = "true" ] && [ -z "$tag" ]; then
+            echo "::error::Publishing needs a tag"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "Building ${tag:-main}, publish=$publish"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.mode.outputs.tag && format('refs/tags/{0}', steps.mode.outputs.tag) || github.sha }}
 
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
@@ -36,37 +79,47 @@ jobs:
           gpg-passphrase-env-var: MAVEN_GPG_PASSPHRASE
 
       - name: Check tag matches pom version
-        if: github.event_name == 'push'
+        if: steps.mode.outputs.tag != ''
+        env:
+          TAG: ${{ steps.mode.outputs.tag }}
         run: |
           version=$(mvn -B -q help:evaluate -Dexpression=project.version -DforceStdout)
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match pom version $version"
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::Tag $TAG does not match pom version $version"
             exit 1
           fi
           case "$version" in *-SNAPSHOT) echo "::error::Refusing to release a SNAPSHOT"; exit 1;; esac
 
-      - name: Check Central token
+      - name: Check Central token and that the version is not published yet
         env:
           CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
           CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
+          TAG: ${{ steps.mode.outputs.tag }}
+          PUBLISH: ${{ steps.mode.outputs.publish }}
         run: |
           # The Publisher API expects "Bearer base64(username:password)".
           token=$(printf '%s:%s' "$CENTRAL_USERNAME" "$CENTRAL_PASSWORD" | base64 -w0)
-          status=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" \
-            "https://central.sonatype.com/api/v1/publisher/published?namespace=com.daktela&name=daktela-v6-java-connector&version=0.0.0")
+          version="${TAG#v}"
+          response=$(curl -s -w '\n%{http_code}' -H "Authorization: Bearer $token" \
+            "https://central.sonatype.com/api/v1/publisher/published?namespace=com.daktela&name=daktela-v6-java-connector&version=${version:-0.0.0}")
+          status=$(printf '%s' "$response" | tail -n1)
           if [ "$status" != "200" ]; then
             echo "::error::Central Portal rejected the token (HTTP $status)"
             exit 1
           fi
+          if [ "$PUBLISH" = "true" ] && printf '%s' "$response" | grep -q '"published":true'; then
+            echo "::error::Version $version is already on Maven Central"
+            exit 1
+          fi
 
       - name: Dry run (test and sign, no upload)
-        if: github.event_name == 'workflow_dispatch'
+        if: steps.mode.outputs.publish != 'true'
         env:
           MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: mvn -B -ntp -P release verify
 
       - name: Test, sign and publish
-        if: github.event_name == 'push'
+        if: steps.mode.outputs.publish == 'true'
         env:
           CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
           CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
@@ -76,20 +129,23 @@ jobs:
   github-release:
     name: Create GitHub release
     needs: publish
-    if: github.event_name == 'push'
+    if: needs.publish.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.publish.outputs.tag }}
 
       - name: Create release from CHANGELOG
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.publish.outputs.tag }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            echo "Release $GITHUB_REF_NAME already exists, leaving it as is."
+          version="${TAG#v}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, leaving it as is."
             exit 0
           fi
           # The section between "## [<version>]" and the next "## [" heading.
@@ -112,5 +168,4 @@ jobs:
             echo "</dependency>"
             echo '```'
           } >> notes.md
-          gh release create "$GITHUB_REF_NAME" --verify-tag --title "daktela-v6-java-connector $GITHUB_REF_NAME" \
-            --notes-file notes.md
+          gh release create "$TAG" --verify-tag --title "daktela-v6-java-connector $TAG" --notes-file notes.md

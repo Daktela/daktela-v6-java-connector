@@ -29,16 +29,28 @@ A release on Maven Central cannot be changed or removed. A mistake means a new p
 6. Watch the Release workflow. Central usually serves the new version within 30 minutes; the
    search page on central.sonatype.com can take a few hours to catch up.
 
-If the workflow fails before the publish step, fix the problem, delete the tag
-(`git push --delete origin vX.Y.Z && git tag -d vX.Y.Z`) and tag again. If it fails after
-publishing, do not re-tag: check the deployment in the Central Portal under **Publish →
-Deployments**.
+If the workflow fails before the publish step because of the code, fix it, delete the tag
+(`git push --delete origin vX.Y.Z && git tag -d vX.Y.Z`) and tag again. If it failed for an
+external reason (expired token, Central outage), fix that and publish the existing tag with a
+manual run (see below). If it fails after publishing, do not re-tag: check the deployment in the
+Central Portal under **Publish → Deployments**.
 
-## Dry run
+## Manual runs
 
-Run the Release workflow manually from the Actions tab (**Run workflow** on `main`). It checks the
-token, runs the tests and signs the artifacts, but uploads nothing. Do this after rotating any
-secret.
+Run the Release workflow from the Actions tab (**Run workflow** on `main`):
+
+- **Dry run of `main`**: leave *tag* empty. It checks the token, runs the tests and signs the
+  artifacts, but uploads nothing. Do this after rotating any secret.
+- **Dry run of a tag**: set *tag* (e.g. `v1.2.0`) and leave *publish* unticked.
+- **Publish an existing tag**: set *tag* and tick *publish*, for example to retry a release
+  whose tag push failed for an external reason. The workflow refuses versions that are already
+  on Maven Central.
+
+From the command line:
+
+```bash
+gh workflow run release.yml --ref main -f tag=v1.2.0 -f publish=false
+```
 
 ## Secrets
 
