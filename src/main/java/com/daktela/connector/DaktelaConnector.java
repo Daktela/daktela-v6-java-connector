@@ -566,7 +566,8 @@ public class DaktelaConnector {
         try {
             uri = URI.create(value);
         } catch (IllegalArgumentException e) {
-            throw new IllegalArgumentException("Invalid instance: " + instance, e);
+            // The cause is dropped on purpose: its message repeats the raw value, which may contain credentials.
+            throw new IllegalArgumentException("Invalid instance, expected a hostname or https:// base URL");
         }
         String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase();
         String path = uri.getRawPath() == null ? "" : uri.getRawPath();
@@ -579,19 +580,19 @@ public class DaktelaConnector {
         if (!(scheme.equals("https") || scheme.equals("http")) || uri.getHost() == null
                 || uri.getRawUserInfo() != null || uri.getRawQuery() != null || uri.getRawFragment() != null
                 || !path.isEmpty()) {
-            throw new IllegalArgumentException("Invalid instance, expected a hostname or https:// base URL: " + instance);
+            // The raw value is left out of the message: it may contain credentials.
+            throw new IllegalArgumentException("Invalid instance, expected a hostname or https:// base URL");
         }
         if (scheme.equals("http") && !isLoopback(uri.getHost())) {
             // Plain HTTP would send the access token in cleartext; only allow it for local test servers.
-            throw new IllegalArgumentException("Instance must use https:// (http:// is allowed for localhost only): "
-                    + instance);
+            throw new IllegalArgumentException("Instance must use https:// (http:// is allowed for localhost only)");
         }
         return scheme + "://" + uri.getRawAuthority();
     }
 
     private static boolean isLoopback(String host) {
         String h = host.toLowerCase();
-        return h.equals("localhost") || h.startsWith("127.") || h.equals("[::1]");
+        return h.equals("localhost") || h.equals("[::1]") || h.matches("127(\\.\\d{1,3}){3}");
     }
 
     /**

@@ -37,6 +37,7 @@ class DaktelaConnectorConfigTest {
         assertEquals("http://127.0.0.1:8080", DaktelaConnector.normalizeBaseUrl("http://127.0.0.1:8080"));
         assertEquals("http://localhost", DaktelaConnector.normalizeBaseUrl("http://localhost"));
         assertThrows(IllegalArgumentException.class, () -> DaktelaConnector.normalizeBaseUrl("http://my.daktela.com"));
+        assertThrows(IllegalArgumentException.class, () -> DaktelaConnector.normalizeBaseUrl("http://127.example.com"));
     }
 
     @ParameterizedTest
@@ -52,6 +53,14 @@ class DaktelaConnectorConfigTest {
     })
     void invalidInstancesAreRejected(String instance) {
         assertThrows(IllegalArgumentException.class, () -> DaktelaConnector.normalizeBaseUrl(instance));
+    }
+
+    @Test
+    void invalidInstanceErrorDoesNotEchoCredentials() {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> DaktelaConnector.normalizeBaseUrl("https://user:hunter2@my.daktela.com"));
+
+        assertFalse(e.getMessage().contains("hunter2"), e.getMessage());
     }
 
     @Test
