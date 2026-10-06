@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Automated releases: pushing a `vX.Y.Z` tag tests, signs and publishes to Maven Central and
+  creates the GitHub release. See [RELEASING.md](RELEASING.md).
+
 ## [1.1.0] - 2026-10-06
 
 ### Fixed

@@ -320,6 +320,10 @@ The build uses Maven and needs JDK 11 or newer:
 mvn clean verify
 ```
 
+## Releasing
+
+See [RELEASING.md](RELEASING.md).
+
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md).
