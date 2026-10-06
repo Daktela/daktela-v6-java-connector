@@ -125,8 +125,9 @@ public class DaktelaConnector {
 
     /**
      * Reads all records matching the query, following pagination until every page is fetched.
-     * The query's {@code take} is used as the page size (default 100) and its {@code skip} as the
-     * starting offset.
+     * The query's {@code take} is used as the page size (default 100, API maximum 1000) and its
+     * {@code skip} as the starting offset. Pages are read with offsets, so add a sort on a stable
+     * field (e.g. {@code name}) when the data may change while you read it.
      *
      * @param endpoint the list endpoint (e.g., "tickets")
      * @param query    the query parameters, may be null
@@ -248,8 +249,12 @@ public class DaktelaConnector {
                 addParam(params, "fields[" + i + "]", fields.get(i));
             }
 
-            if (!query.getFilters().isEmpty()) {
-                addFilterGroup(params, "filter", "and", query.getFilters());
+            List<DaktelaFilter> filters = query.getFilters();
+            if (filters.size() == 1 && filters.get(0).isGroup()) {
+                // A query whose only filter is a group is sent as that group, not wrapped in an extra AND.
+                addFilterGroup(params, "filter", filters.get(0).getLogic(), filters.get(0).getFilters());
+            } else if (!filters.isEmpty()) {
+                addFilterGroup(params, "filter", "and", filters);
             }
 
             List<DaktelaSort> sorts = query.getSorts();
@@ -277,12 +282,6 @@ public class DaktelaConnector {
     }
 
     private void addFilterGroup(List<String> params, String prefix, String logic, List<DaktelaFilter> filters) {
-        // A query whose only filter is a group is sent as that group, not wrapped in an extra AND.
-        if (filters.size() == 1 && filters.get(0).isGroup()) {
-            DaktelaFilter group = filters.get(0);
-            addFilterGroup(params, prefix, group.getLogic(), group.getFilters());
-            return;
-        }
         addParam(params, prefix + "[logic]", logic);
         for (int i = 0; i < filters.size(); i++) {
             addFilter(params, prefix + "[filters][" + i + "]", filters.get(i));
@@ -291,11 +290,7 @@ public class DaktelaConnector {
 
     private void addFilter(List<String> params, String prefix, DaktelaFilter filter) {
         if (filter.isGroup()) {
-            addParam(params, prefix + "[logic]", filter.getLogic());
-            List<DaktelaFilter> children = filter.getFilters();
-            for (int j = 0; j < children.size(); j++) {
-                addFilter(params, prefix + "[filters][" + j + "]", children.get(j));
-            }
+            addFilterGroup(params, prefix, filter.getLogic(), filter.getFilters());
             return;
         }
         addParam(params, prefix + "[field]", filter.getField());
@@ -354,6 +349,10 @@ public class DaktelaConnector {
         }
         if (path.isEmpty()) {
             throw new IllegalArgumentException("endpoint must not be empty");
+        }
+        if (path.indexOf('?') >= 0) {
+            throw new IllegalArgumentException(
+                    "endpoint must not contain a query string; use DaktelaQuery.Builder.param(name, value)");
         }
         StringBuilder encoded = new StringBuilder();
         for (String segment : path.split("/", -1)) {
@@ -432,13 +431,12 @@ public class DaktelaConnector {
 
         Object data = null;
         Integer total = null;
-        Object errorData = null;
         List<Object> errors = null;
 
         if (json instanceof Map) {
             Map<?, ?> envelope = (Map<?, ?>) json;
             Object result = envelope.get("result");
-            if (result instanceof Map && ((Map<?, ?>) result).get("data") != null) {
+            if (isListResult(result)) {
                 // List responses: {"result": {"data": [...], "total": N}}
                 Map<?, ?> resultMap = (Map<?, ?>) result;
                 data = resultMap.get("data");
@@ -453,14 +451,13 @@ public class DaktelaConnector {
                 total = toInteger(envelope.get("total"));
             }
 
-            errorData = envelope.containsKey("error") ? envelope.get("error") : envelope.get("errors");
-            errors = toErrorList(errorData);
+            errors = toErrorList(envelope.containsKey("error") ? envelope.get("error") : envelope.get("errors"));
         } else if (json != null) {
             data = json;
         }
 
-        if (statusCode >= 400) {
-            throw errorFor(statusCode, errorData, errors, responseBody, retryAfter);
+        if (statusCode < 200 || statusCode >= 300) {
+            throw errorFor(statusCode, errors, responseBody, retryAfter);
         }
         if (parseError != null) {
             throw parseError;
@@ -468,7 +465,16 @@ public class DaktelaConnector {
         return new DaktelaResponse(statusCode, data, total, errors, objectMapper);
     }
 
-    private static DaktelaException errorFor(int statusCode, Object errorData, List<Object> errors,
+    private static boolean isListResult(Object result) {
+        if (!(result instanceof Map)) {
+            return false;
+        }
+        Map<?, ?> resultMap = (Map<?, ?>) result;
+        // "total" is omitted only when the caller passes total=false; a record may itself have a "data" field.
+        return resultMap.get("data") instanceof List && (resultMap.containsKey("total") || resultMap.size() == 1);
+    }
+
+    private static DaktelaException errorFor(int statusCode, List<Object> errors,
                                              String responseBody, String retryAfter) {
         String detail = errors != null && !errors.isEmpty()
                 ? errors.toString()
@@ -476,19 +482,19 @@ public class DaktelaConnector {
         switch (statusCode) {
             case 401:
                 return new DaktelaUnauthorizedException(message("Unauthorized", statusCode, detail),
-                        errorData, responseBody);
+                        errors, responseBody);
             case 403:
                 return new DaktelaForbiddenException(message("Forbidden", statusCode, detail),
-                        errorData, responseBody);
+                        errors, responseBody);
             case 404:
                 return new DaktelaNotFoundException(message("Not found", statusCode, detail),
-                        errorData, responseBody);
+                        errors, responseBody);
             case 429:
                 return new DaktelaRateLimitException(message("Rate limit exceeded", statusCode, detail),
-                        parseRetryAfter(retryAfter), errorData, responseBody);
+                        parseRetryAfter(retryAfter), errors, responseBody);
             default:
                 return new DaktelaException(message("Request failed", statusCode, detail),
-                        statusCode, errorData, responseBody, null);
+                        statusCode, errors, responseBody, null);
         }
     }
 
@@ -553,14 +559,7 @@ public class DaktelaConnector {
 
     static String normalizeBaseUrl(String instance) {
         String value = instance.trim();
-        while (value.endsWith("/")) {
-            value = value.substring(0, value.length() - 1);
-        }
-        if (value.endsWith("/api/v6")) {
-            value = value.substring(0, value.length() - "/api/v6".length());
-        }
-        String lower = value.toLowerCase();
-        if (!lower.startsWith("https://") && !lower.startsWith("http://")) {
+        if (!value.contains("://")) {
             value = "https://" + value;
         }
         URI uri;
@@ -569,10 +568,44 @@ public class DaktelaConnector {
         } catch (IllegalArgumentException e) {
             throw new IllegalArgumentException("Invalid instance: " + instance, e);
         }
-        if (uri.getHost() == null) {
-            throw new IllegalArgumentException("Invalid instance: " + instance);
+        String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase();
+        String path = uri.getRawPath() == null ? "" : uri.getRawPath();
+        while (path.endsWith("/")) {
+            path = path.substring(0, path.length() - 1);
         }
-        return value;
+        if (path.equals("/api/v6")) {
+            path = "";
+        }
+        if (!(scheme.equals("https") || scheme.equals("http")) || uri.getHost() == null
+                || uri.getRawUserInfo() != null || uri.getRawQuery() != null || uri.getRawFragment() != null
+                || !path.isEmpty()) {
+            throw new IllegalArgumentException("Invalid instance, expected a hostname or https:// base URL: " + instance);
+        }
+        if (scheme.equals("http") && !isLoopback(uri.getHost())) {
+            // Plain HTTP would send the access token in cleartext; only allow it for local test servers.
+            throw new IllegalArgumentException("Instance must use https:// (http:// is allowed for localhost only): "
+                    + instance);
+        }
+        return scheme + "://" + uri.getRawAuthority();
+    }
+
+    private static boolean isLoopback(String host) {
+        String h = host.toLowerCase();
+        return h.equals("localhost") || h.startsWith("127.") || h.equals("[::1]");
+    }
+
+    /**
+     * Rejects tokens that cannot be sent in a header. The JDK would otherwise fail with an
+     * exception whose message contains the token itself.
+     */
+    private static void validateToken(String token) {
+        for (int i = 0; i < token.length(); i++) {
+            char c = token.charAt(i);
+            if (c < 0x21 || c > 0x7E) {
+                throw new IllegalArgumentException(
+                        "accessToken contains whitespace or non-printable characters (check for a trailing newline)");
+            }
+        }
     }
 
     static ObjectMapper defaultObjectMapper() {
@@ -615,6 +648,7 @@ public class DaktelaConnector {
         /**
          * Sets the Daktela instance. Accepts a hostname ({@code "my.daktela.com"}) or a base URL
          * ({@code "https://my.daktela.com"}); {@code https://} is assumed when no scheme is given.
+         * Plain {@code http://} is accepted only for localhost, so the token is never sent in cleartext.
          *
          * @param instance the instance hostname or base URL
          * @return this builder
@@ -735,6 +769,7 @@ public class DaktelaConnector {
             if (accessToken.isBlank()) {
                 throw new IllegalArgumentException("accessToken must not be blank");
             }
+            validateToken(accessToken);
             if (timeout.isZero() || timeout.isNegative()) {
                 throw new IllegalArgumentException("timeout must be positive");
             }

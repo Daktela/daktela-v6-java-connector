@@ -72,7 +72,8 @@ DaktelaConnector connector = DaktelaConnector.builder()
 ```
 
 `instance` accepts `my.daktela.com`, `https://my.daktela.com` or `https://my.daktela.com/`;
-`https://` is assumed when no scheme is given.
+`https://` is assumed when no scheme is given. Plain `http://` is accepted only for `localhost`,
+so the token is never sent in cleartext.
 
 ### Authentication Methods
 
@@ -95,7 +96,8 @@ Delays grow exponentially from 500 ms.
 
 Endpoints are given without the `/api/v6/` prefix. Path segments are URL-encoded for you, so pass
 record names as they are (`"contacts/" + name`); do not pre-encode them. The `.json` suffix is
-added automatically.
+added automatically. Endpoints must not contain a query string: pass extra parameters with
+`DaktelaQuery.Builder.param(name, value)`.
 
 ### GET
 
@@ -168,7 +170,7 @@ DaktelaQuery.builder()
 
 | Operator | Method | Example |
 |----------|--------|---------|
-| Equal | `eq(field, value)` | `eq("stage", "OPEN")` |
+| Equal | `eq(field, value)` | `eq("stage", "OPEN")`; `eq(field, null)` means is null |
 | Not Equal | `neq(field, value)` | `neq("stage", "CLOSED")` |
 | Greater Than | `gt(field, value)` | `gt("priority", 3)` |
 | Greater Than or Equal | `gte(field, value)` | `gte("created", "2024-01-01")` |
@@ -305,7 +307,7 @@ try {
 } catch (DaktelaException e) {
     // Other API errors (e.g. 400 validation), network errors (status 0), invalid responses
     int status = e.getStatusCode();
-    Object errorData = e.getErrorData();   // e.g. {"form": {"title": "Required"}, "primary": []}
+    Object errorData = e.getErrorData();   // list of API errors, e.g. [{"form": {"title": "Required"}, "primary": []}]
     String body = e.getResponseBody();     // raw body, also for non-JSON proxy error pages
 }
 ```

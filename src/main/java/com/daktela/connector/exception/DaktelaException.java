@@ -2,6 +2,10 @@ package com.daktela.connector.exception;
 
 /**
  * Base exception for all Daktela API errors.
+ * <p>
+ * Messages include the HTTP status and the API's error details, or an excerpt of the response
+ * body when it is not API JSON. Error details can echo record data, so treat messages like any
+ * other data from the API when logging them.
  */
 public class DaktelaException extends RuntimeException {
 

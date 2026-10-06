@@ -118,9 +118,9 @@ class DaktelaConnectorHttpTest {
 
     @Test
     void pathSegmentsAreEncoded() {
-        connector().get("contacts/john doe?#x");
+        connector().get("contacts/john doe#x+y");
 
-        assertEquals("/api/v6/contacts/john%20doe%3F%23x.json", lastRequest().path);
+        assertEquals("/api/v6/contacts/john%20doe%23x%2By.json", lastRequest().path);
     }
 
     @Test
@@ -246,6 +246,43 @@ class DaktelaConnectorHttpTest {
     }
 
     @Test
+    void notInAndBetweenSendValueArrays() {
+        connector().get("tickets", DaktelaQuery.builder()
+                .filter(DaktelaFilter.notIn("stage", "CLOSE"))
+                .filter(DaktelaFilter.between("priority", 1, 3))
+                .build());
+
+        assertEquals(List.of(
+                "filter[logic]=and",
+                "filter[filters][0][field]=stage",
+                "filter[filters][0][operator]=notin",
+                "filter[filters][0][value][0]=CLOSE",
+                "filter[filters][1][field]=priority",
+                "filter[filters][1][operator]=between",
+                "filter[filters][1][value][0]=1",
+                "filter[filters][1][value][1]=3"), lastRequest().decodedParams());
+    }
+
+    @Test
+    void customOperatorWithArrayValueSendsValueArray() {
+        connector().get("tickets", DaktelaQuery.builder()
+                .filter(DaktelaFilter.of("stage", "in", new String[]{"OPEN", "WAIT"}))
+                .build());
+
+        assertTrue(lastRequest().decodedParams().containsAll(List.of(
+                "filter[filters][0][value][0]=OPEN", "filter[filters][0][value][1]=WAIT")));
+    }
+
+    @Test
+    void endpointWithQueryStringIsRejected() {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> connector().get("tickets?stage=OPEN"));
+
+        assertTrue(e.getMessage().contains("param("), e.getMessage());
+        assertTrue(requests.isEmpty());
+    }
+
+    @Test
     void customParamsAreAppended() {
         connector().get("tickets", DaktelaQuery.builder().param("q", "hello world").build());
 
@@ -299,6 +336,25 @@ class DaktelaConnectorHttpTest {
         connector().put("tickets/1", body);
 
         assertEquals("{\"deadline\":\"2024-05-06 07:08:09\",\"day\":\"2024-05-06\"}", lastRequest().body);
+    }
+
+    @Test
+    void recordWithDataFieldIsNotMistakenForList() {
+        reply(200, "{\"result\":{\"name\":\"1\",\"data\":[\"x\"],\"title\":\"Has data field\"}}");
+
+        DaktelaResponse response = connector().get("tickets/1");
+
+        assertEquals("Has data field", response.getDataAsMap().get("title"));
+    }
+
+    @Test
+    void listWithoutTotalIsStillAList() {
+        reply(200, "{\"result\":{\"data\":[{\"name\":\"1\"}]}}");
+
+        DaktelaResponse response = connector().get("tickets", DaktelaQuery.builder().param("total", "false").build());
+
+        assertEquals(1, response.getDataAsList().size());
+        assertFalse(response.hasTotal());
     }
 
     @Test
@@ -370,7 +426,8 @@ class DaktelaConnectorHttpTest {
                 () -> connector().post("tickets", Map.of()));
 
         assertEquals(400, e.getStatusCode());
-        assertEquals(Map.of("form", Map.of("title", "Required"), "primary", List.of()), e.getErrorData());
+        // Same shape as 1.0.0: the error payload wrapped in a list.
+        assertEquals(List.of(Map.of("form", Map.of("title", "Required"), "primary", List.of())), e.getErrorData());
         assertTrue(e.getMessage().contains("Required"), e.getMessage());
     }
 
@@ -416,6 +473,16 @@ class DaktelaConnectorHttpTest {
         assertEquals(502, e.getStatusCode());
         assertTrue(e.getMessage().contains("HTTP 502"), e.getMessage());
         assertEquals("<html><body>Bad Gateway</body></html>", e.getResponseBody());
+    }
+
+    @Test
+    void redirectIsAnError() {
+        replies.add(new Reply(301, "", Map.of("Location", "https://elsewhere.example/")));
+
+        DaktelaException e = assertThrows(DaktelaException.class,
+                () -> connector().post("tickets", Map.of("title", "x")));
+
+        assertEquals(301, e.getStatusCode());
     }
 
     @Test
@@ -485,6 +552,47 @@ class DaktelaConnectorHttpTest {
     }
 
     @Test
+    void networkErrorsAreRetriedForGetOnly() {
+        server.stop(0);
+        DaktelaConnector connector = builder().maxRetries(2).build();
+
+        assertThrows(DaktelaException.class, () -> connector.get("tickets"));
+        assertEquals(List.of(Duration.ofMillis(500), Duration.ofMillis(1000)), sleeps);
+
+        sleeps.clear();
+        assertThrows(DaktelaException.class, () -> connector.post("tickets", Map.of("title", "x")));
+        assertTrue(sleeps.isEmpty());
+    }
+
+    @Test
+    void retryAfterBeyondLimitIsNotWaitedFor() {
+        replies.add(new Reply(429, "{\"error\":[]}", Map.of("Retry-After", "3600")));
+
+        DaktelaRateLimitException e = assertThrows(DaktelaRateLimitException.class,
+                () -> builder().maxRetries(3).build().get("tickets"));
+
+        assertEquals(Duration.ofHours(1), e.getRetryAfter());
+        assertEquals(1, requests.size());
+        assertTrue(sleeps.isEmpty());
+    }
+
+    @Test
+    void interruptedRetryRestoresInterruptFlag() {
+        reply(503, "");
+        DaktelaConnector connector = builder().maxRetries(1)
+                .sleeper(d -> { throw new InterruptedException(); })
+                .build();
+
+        try {
+            DaktelaException e = assertThrows(DaktelaException.class, () -> connector.get("tickets"));
+            assertTrue(e.getCause() instanceof InterruptedException);
+            assertTrue(Thread.currentThread().isInterrupted());
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    @Test
     void serverErrorsAreNotRetriedForWrites() {
         reply(503, "");
 
@@ -519,6 +627,18 @@ class DaktelaConnectorHttpTest {
 
         assertEquals(3, all.size());
         assertEquals(2, requests.size());
+    }
+
+    @Test
+    void getAllStartsAtGivenSkipAndStopsOnEmptyPage() {
+        reply(200, "{\"result\":{\"data\":[{\"name\":\"1\"},{\"name\":\"2\"}]}}");
+        reply(200, "{\"result\":{\"data\":[]}}");
+
+        List<Map<String, Object>> all = connector().getAll("tickets", DaktelaQuery.builder().pagination(2, 10).build());
+
+        assertEquals(2, all.size());
+        assertTrue(requests.get(0).decodedParams().contains("skip=10"));
+        assertTrue(requests.get(1).decodedParams().contains("skip=12"));
     }
 
     @Test

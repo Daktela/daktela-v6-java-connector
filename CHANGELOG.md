@@ -24,9 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Path segments are now URL-encoded, and `.`/`..` segments are rejected.
 - `instance("https://my.daktela.com")` produced `https://https://...`. Hostnames and base URLs are
   both accepted now.
+- An access token with a trailing newline, for example read from a secret file, made the JDK throw an
+  exception whose message contained the token. The builder now rejects such tokens with a message
+  that does not include the token.
+- 3xx responses were returned as successful responses with no data. They now raise
+  `DaktelaException`.
 - `getDataAs(MyType.class)` failed as soon as the API returned a field the type did not declare.
   Unknown properties are now ignored.
-- A filter with a `null` value sent the literal string `"null"`. The value is now omitted.
+- `eq(field, null)` and `neq(field, null)` sent the literal string `"null"`. They now create
+  `isnull` and `isnotnull` filters.
 - Nesting `or(...)` inside `or(...)` threw a `NullPointerException`.
 - The compiler now targets the Java 11 API with `--release 11`, so the published jar cannot depend
   on newer JDK APIs by accident.
@@ -49,13 +55,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `java.time` support: `LocalDateTime` is read and written as `yyyy-MM-dd HH:mm:ss` in bodies,
   typed conversions and filter values. This adds a dependency on `jackson-datatype-jsr310`.
 - The jar manifest now includes `Automatic-Module-Name: com.daktela.connector`.
-- CI that builds and tests on JDK 11, 17 and 21.
+- CI that builds and tests on JDK 11, 17 and 21, with actions pinned to commit SHAs and
+  Dependabot updates.
 
 ### Changed
 - `.json` is appended to endpoint paths, as the official PHP connector does. Paths that already
   end in `.json` are left unchanged.
 - Path segments are URL-encoded. If you pre-encoded record names (`"contacts/a%20b"`), pass the
   raw name instead.
+- Endpoints containing `?` are rejected with `IllegalArgumentException`. Pass extra query
+  parameters with `DaktelaQuery.Builder.param(name, value)` instead.
+- `instance(...)` must be a hostname or an `https://` base URL. `http://` is accepted only for
+  localhost, so the token is never sent in cleartext. Paths, queries and credentials in the
+  instance are rejected.
 - Exception messages now include the HTTP status and the API's error details, for example
   `Request failed (HTTP 400): [...]`.
 - Booleans in filter values are sent as `1`/`0`, and `LocalDate`/`LocalDateTime` values in API
@@ -64,8 +76,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `{or: [...]}`.
 - `DaktelaResponse.toString()` no longer prints record data, which could contain personal data.
 - The default User-Agent reports the real library version (`DaktelaJavaConnector/1.1.0`).
-- `DaktelaQuery.Builder.take()` now requires a positive value, and `skip()` a non-negative one.
-  The builder also rejects a blank instance or token, a non-positive timeout and null settings.
+- Stricter input checks, which fail fast with `IllegalArgumentException` or `NullPointerException`
+  instead of producing a request the API rejects:
+  - `DaktelaQuery.Builder.take()` requires a positive value, and `skip()` a non-negative one.
+  - `in(...)`/`notIn(...)` with no values, and `or()`/`and()` with no filters, are rejected.
+  - Null field names, filters and sorts are rejected.
+  - The connector builder rejects a blank instance or token, a token containing whitespace or
+    control characters, a non-positive timeout, negative `maxRetries` and null settings.
 - Jackson upgraded to 2.22.3 and JUnit to 5.14.4. Maven plugins upgraded.
 
 ### Deprecated

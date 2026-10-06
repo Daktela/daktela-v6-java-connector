@@ -75,25 +75,26 @@ public class DaktelaFilter {
     }
 
     /**
-     * Creates an equals filter (field = value).
+     * Creates an equals filter (field = value). A {@code null} value creates {@link #isNull(String)}.
      *
      * @param field the field name
      * @param value the value to match
      * @return a new filter instance
      */
     public static DaktelaFilter eq(String field, Object value) {
-        return new DaktelaFilter(field, "eq", value);
+        return value == null ? isNull(field) : new DaktelaFilter(field, "eq", value);
     }
 
     /**
-     * Creates a not equals filter (field != value).
+     * Creates a not equals filter (field != value). A {@code null} value creates
+     * {@link #isNotNull(String)}.
      *
      * @param field the field name
      * @param value the value to exclude
      * @return a new filter instance
      */
     public static DaktelaFilter neq(String field, Object value) {
-        return new DaktelaFilter(field, "neq", value);
+        return value == null ? isNotNull(field) : new DaktelaFilter(field, "neq", value);
     }
 
     /**
@@ -224,44 +225,48 @@ public class DaktelaFilter {
      * Creates an in filter (field in values).
      *
      * @param field  the field name
-     * @param values the values to match
+     * @param values the values to match, must not be empty
      * @return a new filter instance
+     * @throws IllegalArgumentException if values is empty
      */
     public static DaktelaFilter in(String field, Collection<?> values) {
-        return new DaktelaFilter(field, "in", new ArrayList<>(values));
+        return new DaktelaFilter(field, "in", nonEmpty(values, "in"));
     }
 
     /**
      * Creates an in filter (field in values).
      *
      * @param field  the field name
-     * @param values the values to match
+     * @param values the values to match, must not be empty
      * @return a new filter instance
+     * @throws IllegalArgumentException if values is empty
      */
     public static DaktelaFilter in(String field, Object... values) {
-        return new DaktelaFilter(field, "in", new ArrayList<>(Arrays.asList(values)));
+        return new DaktelaFilter(field, "in", nonEmpty(Arrays.asList(values), "in"));
     }
 
     /**
      * Creates a not in filter (field not in values).
      *
      * @param field  the field name
-     * @param values the values to exclude
+     * @param values the values to exclude, must not be empty
      * @return a new filter instance
+     * @throws IllegalArgumentException if values is empty
      */
     public static DaktelaFilter notIn(String field, Collection<?> values) {
-        return new DaktelaFilter(field, "notin", new ArrayList<>(values));
+        return new DaktelaFilter(field, "notin", nonEmpty(values, "notIn"));
     }
 
     /**
      * Creates a not in filter (field not in values).
      *
      * @param field  the field name
-     * @param values the values to exclude
+     * @param values the values to exclude, must not be empty
      * @return a new filter instance
+     * @throws IllegalArgumentException if values is empty
      */
     public static DaktelaFilter notIn(String field, Object... values) {
-        return new DaktelaFilter(field, "notin", new ArrayList<>(Arrays.asList(values)));
+        return new DaktelaFilter(field, "notin", nonEmpty(Arrays.asList(values), "notIn"));
     }
 
     /**
@@ -433,6 +438,17 @@ public class DaktelaFilter {
         if (value instanceof Collection) {
             return new ArrayList<>((Collection<?>) value);
         }
+        if (value instanceof Object[]) {
+            return new ArrayList<>(Arrays.asList((Object[]) value));
+        }
         return value;
+    }
+
+    private static List<Object> nonEmpty(Collection<?> values, String method) {
+        if (values.isEmpty()) {
+            // The API rejects an empty list; failing here gives a clearer error.
+            throw new IllegalArgumentException(method + "() needs at least one value");
+        }
+        return new ArrayList<>(values);
     }
 }
