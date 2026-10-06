@@ -8,3 +8,7 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    ignore:
+      # JUnit 6 requires Java 17; the library supports Java 11.
+      - dependency-name: org.junit.jupiter:*
+        versions: [">=6"]
