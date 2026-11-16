@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Automated releases: pushing a `vX.Y.Z` tag tests, signs and publishes to Maven Central and
   creates the GitHub release. See [RELEASING.md](RELEASING.md).
+- CI also builds and tests on JDK 25.
+
+### Changed
+- Jackson upgraded to 2.23.0. Maven plugins and GitHub Actions upgraded.
+- The README documents the Daktela versions that accept `AuthMethod.BEARER` and that static API
+  tokens expire since Daktela 2025.2.
 
 ## [1.1.0] - 2026-10-06
 
