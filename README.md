@@ -36,7 +36,7 @@ import com.daktela.connector.query.DaktelaFilter;
 import com.daktela.connector.query.DaktelaQuery;
 import com.daktela.connector.query.DaktelaSort;
 
-// Create connector (immutable and thread-safe - create once, reuse)
+// Create connector (thread-safe - create once, reuse)
 DaktelaConnector connector = DaktelaConnector.builder()
     .instance("your-instance.daktela.com")
     .accessToken("your-access-token")
@@ -61,19 +61,24 @@ for (var ticket : response.getDataAsList()) {
 ```java
 DaktelaConnector connector = DaktelaConnector.builder()
     .instance("your-instance.daktela.com")  // Required; hostname or https:// base URL
-    .accessToken("your-access-token")        // Required
+    .accessToken("your-access-token")        // Required, or login(username, password)
     .timeout(Duration.ofSeconds(30))         // Optional (default: 30s)
     .authMethod(AuthMethod.HEADER)           // Optional (default: HEADER)
     .userAgent("MyApp/1.0")                  // Optional (default: DaktelaJavaConnector/<version>)
     .maxRetries(3)                           // Optional (default: 0, no retries)
-    .httpClient(customHttpClient)            // Optional, e.g. for a proxy or custom TLS
+    .httpClient(customHttpClient)            // Optional, e.g. for a proxy or custom TLS (see below)
     .objectMapper(customObjectMapper)        // Optional, for custom JSON mapping
     .build();
 ```
 
+A custom `HttpClient` should not follow redirects (the default one does not): a client that follows
+them sends the `X-AUTH-TOKEN` header or the `accessToken` parameter to the redirect target, even on
+another host.
+
 `instance` accepts `my.daktela.com`, `https://my.daktela.com` or `https://my.daktela.com/`;
-`https://` is assumed when no scheme is given. Plain `http://` is accepted only for `localhost`,
-so the token is never sent in cleartext.
+`https://` is assumed when no scheme is given. A base URL may have a path prefix for an instance
+behind a reverse proxy, such as `https://example.com/daktela`; a trailing `/api/v6` is optional.
+Plain `http://` is accepted only for `localhost`, so the token is never sent in cleartext.
 
 ### Authentication Methods
 
@@ -94,15 +99,98 @@ Since Daktela 2025.2 static tokens expire (after up to 720 days, optionally exte
 use). An expired, deactivated or deleted token makes every request fail with
 `DaktelaUnauthorizedException`, so check the expiration date when you set up an integration.
 
+### Logging in with a username and password
+
+If you have no static token, log in with a username and password instead:
+
+```java
+DaktelaConnector connector = DaktelaConnector.builder()
+    .instance("your-instance.daktela.com")
+    .login("username", "password")
+    .build();
+```
+
+The connector logs in with the first request. It refreshes the access token about 60 seconds before
+it expires and after an HTTP 401, and logs in again when the server has ended the session. If the
+server rejects the login (HTTP 400, 401 or 403, or an answer without tokens), the connector sends no
+further login requests, because repeated attempts could lock the account. Later requests on that
+connector fail with the same status, so create a new connector with valid credentials. After a
+rate-limited login it waits for `Retry-After`, and after a server or network error 10 seconds,
+before it sends the password again; requests in the meantime fail without contacting the server.
+
+Accounts with two-factor authentication cannot log in this way; use an access token for them.
+`login(...)` cannot be combined with `accessToken(...)`, or with an `HttpClient` that follows
+redirects, because the password is sent in the request body.
+
+To share one session between processes, or keep it across restarts, pass a `TokenStore`:
+
+```java
+TokenStore tokenStore = new TokenStore() {
+    @Override
+    public TokenSet load() {
+        // secrets is your secure storage, for example an encrypted database table
+        String access = secrets.get("daktela.access");
+        String refresh = secrets.get("daktela.refresh");
+        return access == null || refresh == null
+                ? null
+                : TokenSet.of(access, refresh, secrets.get("daktela.owner"));
+    }
+
+    @Override
+    public void save(TokenSet tokens) {
+        secrets.put("daktela.access", tokens.getAccessToken());
+        secrets.put("daktela.refresh", tokens.getRefreshToken());
+        secrets.put("daktela.owner", tokens.getOwner());
+    }
+};
+
+DaktelaConnector connector = DaktelaConnector.builder()
+    .instance("your-instance.daktela.com")
+    .login("username", "password")
+    .tokenStore(tokenStore)
+    .build();
+```
+
+`TokenSet.of(access, refresh, owner)` restores saved tokens. The connector ignores stored tokens
+of another owner (`username@instance URL`) and tokens whose refresh token has expired, and logs in
+instead. Refresh tokens are long-lived, so store them as securely as passwords. If the store throws,
+the connector logs a warning and continues with the tokens it holds in memory.
+
+The owner check is not authentication: the password is not checked against stored tokens, so a
+connector built with the right username and any password resumes the stored session. Give each
+party that holds a password its own store, for example one per tenant.
+
 ### Retries
 
 With `maxRetries(n)` the connector retries:
 
 - HTTP 429 for every method, waiting for `Retry-After` when the server sends it (up to 60 s);
 - network errors and HTTP 502/503/504 for `GET` only, because a failed write may already have
-  taken effect.
+  taken effect;
+- connection failures (the connection could not be established) for every method, because the
+  server never received the request. Writes (`POST`, `PUT`, `DELETE`) are retried this way only
+  with an `HttpClient` that does not follow redirects; the default client does not follow them. A
+  client that follows redirects could fail on a redirect target after the server has processed the
+  write.
 
 Delays grow exponentially from 500 ms.
+
+## Health Check
+
+```java
+DaktelaHealthCheck check = connector.healthCheck();
+check.isHealthy();       // true when the API is reachable and accepts the credentials
+check.getLatency();      // Duration, including any token refresh and retries
+check.getStatusCode();   // HTTP status, or null when no response was received
+check.getError();        // why it is unhealthy, null when healthy
+
+boolean up = connector.ping();   // same as healthCheck().isHealthy()
+```
+
+`healthCheck()` reads the `whoim` endpoint and never throws a `DaktelaException`; failures are
+reported in the result. The API answers HTTP 200 with no user for a token it does not accept, so
+the check is healthy only when the response identifies a user. With a login session, a response
+without a user triggers one token refresh and one more check.
 
 ## HTTP Methods
 
@@ -141,6 +229,19 @@ List<Map<String, Object>> all = connector.getAll("tickets",
 
 `getAll` keeps requesting pages until it has `total` records or receives a short page.
 Sort by a stable field when paging over data that may change while you read it.
+
+`stream` follows the same rules but reads one page only when the stream reaches it, so large result
+sets do not have to fit in memory. A failed page request throws `DaktelaException` from the terminal
+operation.
+
+```java
+connector.stream("contacts", DaktelaQuery.builder()
+        .sort(DaktelaSort.asc("name"))
+        .take(500)
+        .build())
+    .map(contact -> contact.get("title"))
+    .forEach(System.out::println);
+```
 
 ### POST
 
@@ -323,6 +424,10 @@ try {
     String body = e.getResponseBody();     // raw body, also for non-JSON proxy error pages
 }
 ```
+
+Access and refresh tokens are replaced with `***` in exception messages, `getResponseBody()`,
+`getErrorData()` and `DaktelaResponse.getErrors()`, in case the server echoes them. During a login,
+the password is replaced too.
 
 ## Building from Source
 

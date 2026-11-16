@@ -10,8 +10,14 @@ import com.daktela.connector.query.DaktelaQuery;
 import com.daktela.connector.query.DaktelaSort;
 import com.fasterxml.jackson.core.type.TypeReference;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
+import java.net.ConnectException;
+import java.net.http.HttpClient;
+import java.net.http.HttpConnectTimeoutException;
+import java.net.http.HttpTimeoutException;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -532,6 +538,67 @@ class DaktelaConnectorHttpTest extends HttpTestSupport {
         assertTrue(sleeps.isEmpty());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"POST", "PUT", "DELETE"})
+    void everyWriteIsRetriedWhenTheConnectionCannotBeEstablished(String method) {
+        FailingHttpClient client = new FailingHttpClient(new ConnectException("Connection refused"), HttpClient.Redirect.NEVER);
+        DaktelaConnector connector = builder().maxRetries(2).httpClient(client).build();
+
+        assertThrows(DaktelaException.class, () -> write(connector, method));
+
+        assertEquals(3, client.calls.get());
+        assertEquals(List.of(Duration.ofMillis(500), Duration.ofMillis(1000)), sleeps);
+    }
+
+    @Test
+    void writesAreRetriedOnAConnectTimeout() {
+        FailingHttpClient client = new FailingHttpClient(new HttpConnectTimeoutException("HTTP connect timed out"),
+                HttpClient.Redirect.NEVER);
+
+        assertThrows(DaktelaException.class,
+                () -> builder().maxRetries(1).httpClient(client).build().post("tickets", Map.of("title", "x")));
+
+        assertEquals(2, client.calls.get());
+    }
+
+    @Test
+    void writesAreNotRetriedAfterARequestTimeout() {
+        // The request was sent; only the response did not arrive in time.
+        FailingHttpClient client = new FailingHttpClient(new HttpTimeoutException("request timed out"),
+                HttpClient.Redirect.NEVER);
+
+        assertThrows(DaktelaException.class,
+                () -> builder().maxRetries(3).httpClient(client).build().post("tickets", Map.of("title", "x")));
+
+        assertEquals(1, client.calls.get());
+        assertTrue(sleeps.isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"NORMAL", "ALWAYS"})
+    void writesAreNotRetriedOnConnectFailureWithAnyRedirectPolicy(String redirect) {
+        FailingHttpClient client = new FailingHttpClient(new ConnectException("Connection refused"),
+                HttpClient.Redirect.valueOf(redirect));
+
+        assertThrows(DaktelaException.class,
+                () -> builder().maxRetries(3).httpClient(client).build().post("tickets", Map.of("title", "x")));
+
+        assertEquals(1, client.calls.get());
+    }
+
+    private static void write(DaktelaConnector connector, String method) {
+        switch (method) {
+            case "POST":
+                connector.post("tickets", Map.of("title", "x"));
+                break;
+            case "PUT":
+                connector.put("tickets/1", Map.of("title", "x"));
+                break;
+            default:
+                connector.delete("tickets/1");
+        }
+    }
+
     @Test
     void retryAfterBeyondLimitIsNotWaitedFor() {
         replies.add(new Reply(429, "{\"error\":[]}", Map.of("Retry-After", "3600")));
@@ -654,6 +721,28 @@ class DaktelaConnectorHttpTest extends HttpTestSupport {
 
         assertEquals(500, e.getStatusCode());
         assertEquals(List.of("1", "2"), seen);
+    }
+
+    @Test
+    void streamStopsAtThePageLimit() {
+        for (int i = 0; i < 4; i++) {
+            reply(200, "{\"result\":{\"data\":[{\"name\":\"a\"},{\"name\":\"b\"}]}}");
+        }
+        DaktelaConnector connector = builder().maxPages(3).build();
+
+        DaktelaException e = assertThrows(DaktelaException.class,
+                () -> connector.stream("tickets", DaktelaQuery.builder().take(2).build()).count());
+
+        assertTrue(e.getMessage().contains("exceeded 3 pages"), e.getMessage());
+        assertEquals(3, requests.size());
+    }
+
+    @Test
+    void streamOfNonListDataIsEmpty() {
+        reply(200, "{\"result\":{\"name\":\"x\"}}");
+
+        assertEquals(0, connector().stream("tickets", null).count());
+        assertEquals(1, requests.size());
     }
 
     @Test

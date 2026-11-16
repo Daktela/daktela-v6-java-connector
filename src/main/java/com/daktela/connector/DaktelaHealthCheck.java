@@ -40,7 +40,8 @@ public final class DaktelaHealthCheck {
     }
 
     /**
-     * Returns the HTTP status of the response.
+     * Returns the HTTP status of the response. After the server rejected a login, the connector
+     * sends no further login, and this is the status of that rejected login.
      *
      * @return the status, or null when no response was received (for example on a network error)
      */

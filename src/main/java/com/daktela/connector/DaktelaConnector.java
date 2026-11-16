@@ -25,6 +25,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpConnectTimeoutException;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
@@ -75,7 +76,7 @@ public class DaktelaConnector {
     private static final String API_PATH = "/api/v6/";
     private static final String JSON_SUFFIX = ".json";
     private static final int DEFAULT_PAGE_SIZE = 100;
-    private static final int MAX_PAGES = 10_000;
+    private static final int DEFAULT_MAX_PAGES = 10_000;
     private static final int MAX_BODY_IN_MESSAGE = 500;
     private static final Duration MAX_RETRY_DELAY = Duration.ofSeconds(60);
     private static final Duration INITIAL_BACKOFF = Duration.ofMillis(500);
@@ -96,6 +97,7 @@ public class DaktelaConnector {
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
     private final Sleeper sleeper;
+    private final int maxPages;
 
     private DaktelaConnector(Builder builder) {
         this.baseUrl = normalizeBaseUrl(builder.instance);
@@ -113,6 +115,7 @@ public class DaktelaConnector {
                 ? builder.httpClient
                 : HttpClient.newBuilder().connectTimeout(this.timeout).build();
         this.sleeper = builder.sleeper;
+        this.maxPages = builder.maxPages;
     }
 
     /**
@@ -196,8 +199,8 @@ public class DaktelaConnector {
         long start = System.nanoTime();
         try {
             DaktelaResponse response = get("whoim");
-            if (session != null && !identifiesUser(response)) {
-                // whoim answers a session the server has ended with no user instead of HTTP 401.
+            if (session != null && hasNullUser(response)) {
+                // whoim answers a session the server has ended with a null user instead of HTTP 401.
                 session.refreshNow(this::postCredentials);
                 response = get("whoim");
             }
@@ -223,6 +226,11 @@ public class DaktelaConnector {
     private static boolean identifiesUser(DaktelaResponse response) {
         // whoim is public: a token it does not accept still gets HTTP 200, with a null user.
         return response.getDataAsMap().get("user") != null;
+    }
+
+    private static boolean hasNullUser(DaktelaResponse response) {
+        Map<String, Object> result = response.getDataAsMap();
+        return result.containsKey("user") && result.get("user") == null;
     }
 
     private static String describeUnhealthy(DaktelaResponse response) {
@@ -294,7 +302,7 @@ public class DaktelaConnector {
             String token = currentAccessToken();
             HttpRequest request = buildRequest(withQueryToken(url, token), method, body, token);
             try {
-                return send(request, null);
+                return send(request, null, false);
             } catch (DaktelaUnauthorizedException e) {
                 if (session == null || reauthenticated) {
                     throw e;
@@ -329,7 +337,7 @@ public class DaktelaConnector {
      * access token is attached.
      */
     private DaktelaResponse postCredentials(String endpoint, Map<String, Object> payload, String extraSecret) {
-        return send(buildRequest(baseUrl + API_PATH + encodePath(endpoint), "POST", payload, null), extraSecret);
+        return send(buildRequest(baseUrl + API_PATH + encodePath(endpoint), "POST", payload, null), extraSecret, true);
     }
 
     private boolean isRetryable(DaktelaException e, boolean idempotent) {
@@ -540,18 +548,49 @@ public class DaktelaConnector {
      *
      * @param extraSecret a secret to redact from errors besides the tokens (the password of a login), or null
      */
-    private DaktelaResponse send(HttpRequest request, String extraSecret) {
+    private DaktelaResponse send(HttpRequest request, String extraSecret, boolean issuesTokens) {
         HttpResponse<String> response;
         try {
             response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
         } catch (IOException e) {
-            throw new DaktelaException("Network error: " + redactor(extraSecret).redact(String.valueOf(e.getMessage())), e);
+            Redactor redactor = redactor(extraSecret);
+            throw new DaktelaException("Network error: " + redactor.redact(String.valueOf(e.getMessage())),
+                    withoutSecrets(e, redactor));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new DaktelaException("Request interrupted", e);
         }
         return parseResponse(response.statusCode(), response.body(),
-                response.headers().firstValue("Retry-After").orElse(null), extraSecret);
+                response.headers().firstValue("Retry-After").orElse(null), extraSecret, issuesTokens);
+    }
+
+    /**
+     * Returns the exception itself, or, when its message or a message in its cause chain contains a
+     * secret (for example a URL with the token from a custom HttpClient), a copy of the same kind
+     * with the secret replaced and without the chain. The kind decides whether a write is retried.
+     */
+    private static IOException withoutSecrets(IOException e, Redactor redactor) {
+        boolean leaks = false;
+        for (Throwable t = e; t != null && !leaks; t = t.getCause()) {
+            String message = t.getMessage();
+            leaks = message != null && !message.equals(redactor.redact(message));
+        }
+        if (!leaks) {
+            return e;
+        }
+        String message = redactor.redact(e.getMessage());
+        IOException copy;
+        if (e instanceof HttpConnectTimeoutException) {
+            copy = new HttpConnectTimeoutException(message);
+        } else if (e instanceof HttpTimeoutException) {
+            copy = new HttpTimeoutException(message);
+        } else if (e instanceof ConnectException) {
+            copy = new ConnectException(message);
+        } else {
+            copy = new IOException(message);
+        }
+        copy.setStackTrace(e.getStackTrace());
+        return copy;
     }
 
     /** Redacts the access token, the session tokens and the given extra secret. */
@@ -565,7 +604,12 @@ public class DaktelaConnector {
         return Redactor.of(secrets);
     }
 
-    DaktelaResponse parseResponse(int statusCode, String responseBody, String retryAfter, String extraSecret) {
+    /**
+     * @param issuesTokens whether this is a login or refresh request: a successful response to one
+     *                     carries new tokens, which the redactor does not know yet
+     */
+    DaktelaResponse parseResponse(int statusCode, String responseBody, String retryAfter, String extraSecret,
+                                  boolean issuesTokens) {
         Object json = null;
         boolean invalidJson = false;
         if (responseBody != null && !responseBody.isBlank()) {
@@ -615,6 +659,11 @@ public class DaktelaConnector {
         List<Object> redactedErrors = (List<Object>) redactor.redactJson(errors);
         if (!success) {
             throw errorFor(statusCode, redactedErrors, body, retryAfter);
+        }
+        if (invalidJson && issuesTokens) {
+            // The body may hold the tokens just issued, which cannot be redacted without parsing it.
+            throw new DaktelaException("Invalid JSON in API response (HTTP " + statusCode
+                    + "); the body is left out because it may contain new tokens", statusCode);
         }
         if (invalidJson) {
             throw new DaktelaException("Invalid JSON in API response (HTTP " + statusCode + "): " + abbreviate(body),
@@ -837,8 +886,8 @@ public class DaktelaConnector {
         }
 
         private void fetchNextPage() {
-            if (pages++ >= MAX_PAGES) {
-                throw new DaktelaException("Pagination of '" + endpoint + "' exceeded " + MAX_PAGES + " pages");
+            if (pages++ >= maxPages) {
+                throw new DaktelaException("Pagination of '" + endpoint + "' exceeded " + maxPages + " pages");
             }
             DaktelaResponse response = get(endpoint, base.toBuilder().pagination(pageSize, skip).build());
             if (!(response.getData() instanceof List)) {
@@ -875,6 +924,7 @@ public class DaktelaConnector {
         private TokenStore tokenStore;
         private Sleeper sleeper = duration -> Thread.sleep(duration.toMillis());
         private Clock clock = Clock.systemUTC();
+        private int maxPages = DEFAULT_MAX_PAGES;
 
         private Builder() {
         }
@@ -946,8 +996,11 @@ public class DaktelaConnector {
          * Sets how many times a failed request is retried (default 0, no retries).
          * <p>
          * Rate-limited requests (HTTP 429) are retried for every method, honouring
-         * {@code Retry-After}. Network errors and HTTP 502/503/504 are retried for GET only,
-         * because other methods may already have taken effect. Delays grow exponentially from 500 ms.
+         * {@code Retry-After}. A connection that could not be established is retried for every
+         * method, because the server never received the request, provided the HttpClient does not
+         * follow redirects (the default one does not). Other network errors and HTTP 502/503/504 are
+         * retried for GET only, because other methods may already have taken effect. Delays grow
+         * exponentially from 500 ms.
          *
          * @param maxRetries number of retries, must not be negative
          * @return this builder
@@ -960,6 +1013,11 @@ public class DaktelaConnector {
         /**
          * Uses a custom {@link HttpClient}, for example to configure a proxy or TLS settings.
          * The connector's timeout is still applied per request.
+         * <p>
+         * Prefer a client that does not follow redirects, as the default one. A client that follows
+         * them sends the {@code X-AUTH-TOKEN} header, or the {@code accessToken} parameter, to the
+         * redirect target, even on another host. {@link #login(String, String)} refuses such a
+         * client, and writes are not retried after a failed connection with it.
          *
          * @param httpClient the HTTP client
          * @return this builder
@@ -1022,6 +1080,11 @@ public class DaktelaConnector {
 
         Builder clock(Clock clock) {
             this.clock = clock;
+            return this;
+        }
+
+        Builder maxPages(int maxPages) {
+            this.maxPages = maxPages;
             return this;
         }
 

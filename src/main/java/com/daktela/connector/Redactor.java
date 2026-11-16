@@ -38,9 +38,12 @@ final class Redactor {
             forms.add(secret);
             forms.add(URLEncoder.encode(secret, StandardCharsets.UTF_8));
             forms.add(percentEncode(secret));
-            forms.add(json);
-            // PHP's json_encode, which the server uses, also escapes the slash.
-            forms.add(json.replace("/", "\\/"));
+            // PHP's json_encode, which the server uses, also escapes the slash and writes non-ASCII
+            // characters as \\uXXXX.
+            for (String escaped : List.of(json, json.replace("/", "\\/"))) {
+                forms.add(escaped);
+                forms.add(escapeNonAscii(escaped));
+            }
         }
         if (forms.isEmpty()) {
             return NONE;
@@ -88,6 +91,18 @@ final class Redactor {
             return copy;
         }
         return value;
+    }
+
+    private static String escapeNonAscii(String value) {
+        StringBuilder escaped = new StringBuilder();
+        for (char c : value.toCharArray()) {
+            if (c < 0x80) {
+                escaped.append(c);
+            } else {
+                escaped.append(String.format("\\u%04x", (int) c));
+            }
+        }
+        return escaped.toString();
     }
 
     /** RFC 3986 encoding: everything except unreserved characters is percent-encoded. */

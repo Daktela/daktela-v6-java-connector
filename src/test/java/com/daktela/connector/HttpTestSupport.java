@@ -9,12 +9,14 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
@@ -22,6 +24,11 @@ import java.util.Collections;
 import java.util.Deque;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Runs a local HTTP server that answers with queued replies and records every request, to pin
@@ -33,7 +40,7 @@ abstract class HttpTestSupport {
     static final int CLOSE_CONNECTION = -1;
 
     HttpServer server;
-    final Deque<Reply> replies = new ArrayDeque<>();
+    final Deque<Reply> replies = new ConcurrentLinkedDeque<>();
     final List<Recorded> requests = Collections.synchronizedList(new ArrayList<>());
     final List<Duration> sleeps = new ArrayList<>();
     final MutableClock clock = new MutableClock(Instant.parse("2026-11-16T12:00:00Z"));
@@ -155,6 +162,80 @@ abstract class HttpTestSupport {
                         + URLDecoder.decode(pair.substring(eq + 1), StandardCharsets.UTF_8));
             }
             return params;
+        }
+    }
+
+    /** An HttpClient whose every request fails with the given exception. */
+    static final class FailingHttpClient extends HttpClient {
+        final AtomicInteger calls = new AtomicInteger();
+        private final IOException failure;
+        private final Redirect redirect;
+
+        FailingHttpClient(IOException failure, Redirect redirect) {
+            this.failure = failure;
+            this.redirect = redirect;
+        }
+
+        @Override
+        public <T> HttpResponse<T> send(HttpRequest request, HttpResponse.BodyHandler<T> handler) throws IOException {
+            calls.incrementAndGet();
+            throw failure;
+        }
+
+        @Override
+        public <T> CompletableFuture<HttpResponse<T>> sendAsync(HttpRequest request, HttpResponse.BodyHandler<T> handler) {
+            return CompletableFuture.failedFuture(failure);
+        }
+
+        @Override
+        public <T> CompletableFuture<HttpResponse<T>> sendAsync(HttpRequest request, HttpResponse.BodyHandler<T> handler,
+                                                                HttpResponse.PushPromiseHandler<T> pushPromiseHandler) {
+            return CompletableFuture.failedFuture(failure);
+        }
+
+        @Override
+        public Optional<java.net.CookieHandler> cookieHandler() {
+            return Optional.empty();
+        }
+
+        @Override
+        public Optional<Duration> connectTimeout() {
+            return Optional.empty();
+        }
+
+        @Override
+        public Redirect followRedirects() {
+            return redirect;
+        }
+
+        @Override
+        public Optional<java.net.ProxySelector> proxy() {
+            return Optional.empty();
+        }
+
+        @Override
+        public javax.net.ssl.SSLContext sslContext() {
+            return null;
+        }
+
+        @Override
+        public javax.net.ssl.SSLParameters sslParameters() {
+            return new javax.net.ssl.SSLParameters();
+        }
+
+        @Override
+        public Optional<java.net.Authenticator> authenticator() {
+            return Optional.empty();
+        }
+
+        @Override
+        public Version version() {
+            return Version.HTTP_1_1;
+        }
+
+        @Override
+        public Optional<Executor> executor() {
+            return Optional.empty();
         }
     }
 

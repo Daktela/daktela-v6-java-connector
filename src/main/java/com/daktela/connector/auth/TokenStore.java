@@ -10,6 +10,11 @@ package com.daktela.connector.auth;
  * credentials, so store them as securely as passwords. The connector calls the store from the
  * thread that sends a request; when the store throws, the connector logs a warning and continues
  * with the tokens it holds in memory.
+ * <p>
+ * The connector checks only that saved tokens belong to the same username and instance; it does
+ * not check the password against them. Whoever can build a connector that reads a store therefore
+ * gets its session, so give each party that holds a password its own store (for example one per
+ * tenant), never one shared by several of them.
  */
 public interface TokenStore {
 

@@ -12,10 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI also builds and tests on JDK 25.
 - Login with a username and password: `builder().login(username, password)` instead of
   `accessToken(...)`. The connector refreshes the short-lived access token before it expires and
-  after an HTTP 401, and logs in again when the server has ended the session. An optional
+  after an HTTP 401, and logs in again when the server has ended the session. After the server
+  rejects the login (HTTP 400, 401 or 403, or an answer without tokens) it sends no further login,
+  and after a rate-limited or failed login it waits before the next one, so that it does not lock
+  the account. Accounts with two-factor authentication still need an access token. An optional
   `TokenStore` (`builder().tokenStore(...)`) lets processes share one session.
-- `connector.healthCheck()` and `connector.ping()` check that the API is reachable and accepts the
-  credentials, using the `whoim` endpoint.
+- `connector.healthCheck()` returns a `DaktelaHealthCheck` that reports whether the API is reachable
+  and accepts the credentials, using the `whoim` endpoint. It never throws. `connector.ping()`
+  returns the same result as a boolean.
 - `connector.stream(endpoint, query)` reads all pages lazily, one page at a time.
 - `instance(...)` accepts a base URL with a path prefix, such as `https://example.com/daktela`.
 
@@ -25,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tokens expire since Daktela 2025.2.
 - With `maxRetries(n)`, a write (`post`, `put`, `delete`) is now retried when the connection could
   not be established, because the server never received it. This needs an `HttpClient` that does
-  not follow redirects, as the default one does.
+  not follow redirects; the default client does not follow them.
 - An invalid JSON response no longer chains the JSON parser's exception as the cause, because its
   message can quote the response body.
 

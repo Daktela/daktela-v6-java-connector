@@ -26,10 +26,13 @@ class TokenSetTest {
 
         assertEquals(Instant.ofEpochSecond(exp), tokens.getAccessTokenExpiresAt());
         assertEquals(Instant.ofEpochSecond(exp + 3600), tokens.getRefreshTokenExpiresAt());
-        assertFalse(tokens.accessTokenExpiresWithin(Duration.ofMinutes(59), NOW));
-        assertTrue(tokens.accessTokenExpiresWithin(Duration.ofMinutes(60), NOW));
-        assertFalse(tokens.isRefreshTokenExpired(NOW));
-        assertTrue(tokens.isRefreshTokenExpired(Instant.ofEpochSecond(exp + 3600)));
+    }
+
+    @Test
+    void expBeyondTheRangeOfInstantIsUnknown() {
+        TokenSet tokens = TokenSet.of(jwt("{\"exp\":9223372036854775807}"), "refresh", null);
+
+        assertNull(tokens.getAccessTokenExpiresAt());
     }
 
     @Test
@@ -38,8 +41,6 @@ class TokenSetTest {
 
         assertNull(tokens.getAccessTokenExpiresAt());
         assertNull(tokens.getRefreshTokenExpiresAt());
-        assertFalse(tokens.accessTokenExpiresWithin(Duration.ofDays(365), NOW));
-        assertFalse(tokens.isRefreshTokenExpired(NOW));
         assertNull(TokenSet.of("a.!!!.c", "b", null).getAccessTokenExpiresAt());
     }
 

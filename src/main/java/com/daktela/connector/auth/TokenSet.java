@@ -4,7 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
-import java.time.Duration;
+import java.time.DateTimeException;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.Objects;
@@ -71,7 +71,7 @@ public final class TokenSet {
 
     /**
      * Returns the session the tokens were issued for, as {@code username@instance URL}. The connector
-     * ignores stored tokens of another session.
+     * ignores stored tokens of another session. This is not authentication: see {@link TokenStore}.
      *
      * @return the owner, or null when unknown
      */
@@ -97,27 +97,6 @@ public final class TokenSet {
         return refreshTokenExpiresAt;
     }
 
-    /**
-     * Returns whether the access token expires within the given margin.
-     *
-     * @param margin the margin before the expiry
-     * @param now    the current time
-     * @return true if it expires within the margin; false when its expiry is unknown
-     */
-    public boolean accessTokenExpiresWithin(Duration margin, Instant now) {
-        return accessTokenExpiresAt != null && !accessTokenExpiresAt.minus(margin).isAfter(now);
-    }
-
-    /**
-     * Returns whether the refresh token has expired.
-     *
-     * @param now the current time
-     * @return true if it has expired; false when its expiry is unknown
-     */
-    public boolean isRefreshTokenExpired(Instant now) {
-        return refreshTokenExpiresAt != null && !refreshTokenExpiresAt.isAfter(now);
-    }
-
     @Override
     public String toString() {
         return "TokenSet{owner=" + owner
@@ -135,7 +114,8 @@ public final class TokenSet {
             return exp != null && exp.canConvertToLong() && exp.isIntegralNumber()
                     ? Instant.ofEpochSecond(exp.longValue())
                     : null;
-        } catch (IllegalArgumentException | IOException e) {
+        } catch (IllegalArgumentException | IOException | DateTimeException e) {
+            // Not a JWT, or an exp claim outside the range of Instant: the expiry is unknown.
             return null;
         }
     }

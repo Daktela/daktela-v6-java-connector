@@ -56,6 +56,33 @@ class HealthCheckHttpTest extends HttpTestSupport {
     }
 
     @Test
+    void firstNestedErrorMessageIsReported() {
+        reply(400, "{\"error\":[{\"form\":{\"title\":\" \"}}, [\"\", \"Nested message\"]]}");
+        reply(400, "{\"error\":\"Plain message\"}");
+        DaktelaConnector connector = connector();
+
+        assertEquals("Nested message", connector.healthCheck().getError());
+        assertEquals("Plain message", connector.healthCheck().getError());
+    }
+
+    @Test
+    void emptyOrInvalidSuccessfulResponseIsUnhealthy() {
+        reply(200, "");
+        reply(200, "<html>maintenance</html>");
+        DaktelaConnector connector = connector();
+
+        DaktelaHealthCheck empty = connector.healthCheck();
+        assertFalse(empty.isHealthy());
+        assertEquals(Integer.valueOf(200), empty.getStatusCode());
+        assertTrue(empty.getError().contains("check the instance URL"), empty.getError());
+
+        DaktelaHealthCheck invalid = connector.healthCheck();
+        assertFalse(invalid.isHealthy());
+        assertEquals(Integer.valueOf(200), invalid.getStatusCode());
+        assertTrue(invalid.getError().startsWith("Invalid JSON"), invalid.getError());
+    }
+
+    @Test
     void httpErrorWithoutMessageIsReported() {
         reply(401, "");
 

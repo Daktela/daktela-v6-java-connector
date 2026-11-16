@@ -3,10 +3,13 @@ package com.daktela.connector;
 import com.daktela.connector.auth.TokenSet;
 import com.daktela.connector.auth.TokenStore;
 import com.daktela.connector.exception.DaktelaException;
+import com.daktela.connector.exception.DaktelaForbiddenException;
+import com.daktela.connector.exception.DaktelaRateLimitException;
 import com.daktela.connector.exception.DaktelaUnauthorizedException;
 
 import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -24,6 +27,10 @@ final class LoginSession {
 
     /** How long before the expiry of the access token it is refreshed. */
     static final Duration REFRESH_MARGIN = Duration.ofSeconds(60);
+    /** How long to wait before trying again after a refresh failed while the token was still valid. */
+    static final Duration REFRESH_RETRY_DELAY = Duration.ofSeconds(15);
+    /** How long to wait before logging in again after a login failed for a reason other than rejection. */
+    static final Duration LOGIN_RETRY_DELAY = Duration.ofSeconds(10);
 
     private static final int MAX_RETIRED_TOKENS = 4;
     private static final System.Logger LOG = System.getLogger(DaktelaConnector.class.getName());
@@ -48,8 +55,12 @@ final class LoginSession {
     private volatile TokenSet tokens;
     private volatile List<String> retiredTokens = List.of();
     private volatile boolean refreshBeforeExpiry = true;
+    private volatile Instant refreshNotBefore = Instant.MIN;
     /** HTTP status of a login the server rejected, or 0. No further login is sent after one. */
     private volatile int rejectedStatus;
+    /** After a failed login: when the next one may be sent, and the failure to report until then. */
+    private Instant loginNotBefore = Instant.MIN;
+    private DaktelaException lastLoginFailure;
 
     LoginSession(String username, String password, String owner, TokenStore tokenStore, Clock clock) {
         this.username = username;
@@ -64,26 +75,25 @@ final class LoginSession {
      */
     String accessToken(Transport transport) {
         TokenSet current = tokens;
-        if (current == null) {
-            synchronized (lock) {
-                if (tokens == null) {
-                    start(transport);
-                }
-                return tokens.getAccessToken();
-            }
-        }
-        if (!refreshBeforeExpiry || !current.accessTokenExpiresWithin(REFRESH_MARGIN, clock.instant())) {
+        if (current != null && !expiresSoon(current)) {
             return current.getAccessToken();
         }
         synchronized (lock) {
-            if (tokens == current) {
+            // Another thread may have logged in or refreshed while this one waited.
+            if (tokens == null) {
+                start(transport);
+            }
+            if (expiresSoon(tokens)) {
                 try {
                     refresh(transport);
                 } catch (DaktelaException e) {
                     TokenSet left = tokens;
-                    if (left == null || left.accessTokenExpiresWithin(Duration.ZERO, clock.instant())) {
+                    if (left == null || expiresWithin(left.getAccessTokenExpiresAt(), Duration.ZERO)) {
                         throw e;
                     }
+                    // Without a pause every request, one after another under the lock, would wait for
+                    // the failing refresh although the current token still works.
+                    refreshNotBefore = clock.instant().plus(REFRESH_RETRY_DELAY);
                     LOG.log(System.Logger.Level.WARNING,
                             "Refreshing the Daktela access token failed; the current one is used until it expires: {0}",
                             e.getMessage());
@@ -91,6 +101,20 @@ final class LoginSession {
             }
             return tokens.getAccessToken();
         }
+    }
+
+    private boolean expiresSoon(TokenSet current) {
+        if (!refreshBeforeExpiry) {
+            return false;
+        }
+        Instant expiresAt = current.getAccessTokenExpiresAt();
+        return expiresWithin(expiresAt, Duration.ZERO)
+                || (expiresWithin(expiresAt, REFRESH_MARGIN) && !clock.instant().isBefore(refreshNotBefore));
+    }
+
+    /** Whether the expiry is within the margin from now; false when the expiry is unknown. */
+    private boolean expiresWithin(Instant expiresAt, Duration margin) {
+        return expiresAt != null && !expiresAt.minus(margin).isAfter(clock.instant());
     }
 
     /**
@@ -115,8 +139,10 @@ final class LoginSession {
 
     /** The tokens of this session, including recently replaced ones, which responses may still echo. */
     List<String> secrets() {
-        List<String> secrets = new ArrayList<>(retiredTokens);
+        // use() writes retiredTokens before tokens, so reading them in the opposite order cannot miss
+        // a token that is being replaced.
         TokenSet current = tokens;
+        List<String> secrets = new ArrayList<>(retiredTokens);
         if (current != null) {
             secrets.add(current.getAccessToken());
             secrets.add(current.getRefreshToken());
@@ -138,9 +164,18 @@ final class LoginSession {
         if (rejected != 0) {
             String message = "The server rejected the login (HTTP " + rejected
                     + "); build a new connector with valid credentials";
-            throw rejected == 401
-                    ? new DaktelaUnauthorizedException(message, null, null)
+            if (rejected == 401) {
+                throw new DaktelaUnauthorizedException(message, null, null);
+            }
+            throw rejected == 403
+                    ? new DaktelaForbiddenException(message, null, null)
                     : new DaktelaException(message, rejected);
+        }
+        Instant now = clock.instant();
+        if (now.isBefore(loginNotBefore)) {
+            // Sending the password with every request while the server is failing or rate-limiting
+            // logins would keep an account or IP blocked.
+            throw coolingDown(Duration.between(now, loginNotBefore));
         }
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("username", username);
@@ -149,26 +184,58 @@ final class LoginSession {
         payload.put("only_token", "true");
         // The connector refreshes the session itself; the server does not renew it implicitly.
         payload.put("client_side_refresh", "true");
-        TokenSet received;
+        DaktelaResponse response;
         try {
             // An error response to a login may echo the password, so it is redacted as well.
-            received = tokensFrom(transport.post("login", payload, password), null, "login");
+            response = transport.post("login", payload, password);
         } catch (DaktelaException e) {
-            if (e.getStatusCode() == 400 || e.getStatusCode() == 401) {
-                // Repeating a rejected login could lock the account.
-                rejectedStatus = e.getStatusCode();
-                retire(tokens);
-                tokens = null;
+            int status = e.getStatusCode();
+            if (status == 400 || status == 401 || status == 403) {
+                // Rejected credentials or a blocked account: repeating the login could lock the account.
+                reject(status);
+            } else {
+                Duration wait = e instanceof DaktelaRateLimitException
+                        && ((DaktelaRateLimitException) e).getRetryAfter() != null
+                        ? ((DaktelaRateLimitException) e).getRetryAfter()
+                        : LOGIN_RETRY_DELAY;
+                loginNotBefore = clock.instant().plus(wait.compareTo(LOGIN_RETRY_DELAY) > 0 ? wait : LOGIN_RETRY_DELAY);
+                lastLoginFailure = e;
             }
             throw e;
         }
+        TokenSet received;
+        try {
+            received = tokensFrom(response, null, "login");
+        } catch (DaktelaException e) {
+            // An answer without tokens, for example a second factor the connector cannot provide,
+            // would be the same next time.
+            reject(e.getStatusCode());
+            throw e;
+        }
+        loginNotBefore = Instant.MIN;
+        lastLoginFailure = null;
         use(received, true);
         saveTokens();
     }
 
+    private void reject(int status) {
+        rejectedStatus = status;
+        retire(tokens);
+        tokens = null;
+    }
+
+    private DaktelaException coolingDown(Duration remaining) {
+        String message = "Logging in failed recently (" + lastLoginFailure.getMessage() + "); the next login is sent in "
+                + Math.max(1, remaining.toSeconds()) + " s";
+        if (lastLoginFailure instanceof DaktelaRateLimitException) {
+            return new DaktelaRateLimitException(message, remaining, null, null);
+        }
+        return new DaktelaException(message, lastLoginFailure.getStatusCode(), lastLoginFailure);
+    }
+
     private void refresh(Transport transport) {
         TokenSet current = tokens;
-        if (current == null || current.isRefreshTokenExpired(clock.instant())) {
+        if (current == null || expiresWithin(current.getRefreshTokenExpiresAt(), Duration.ZERO)) {
             login(transport);
             return;
         }
@@ -214,7 +281,8 @@ final class LoginSession {
         tokens = received;
         // A token that looks expired as soon as it is issued means the local clock is ahead of the
         // server. Refreshing it before every request would not help, so it is refreshed after a 401.
-        refreshBeforeExpiry = !issuedNow || !received.accessTokenExpiresWithin(REFRESH_MARGIN, clock.instant());
+        refreshBeforeExpiry = !issuedNow || !expiresWithin(received.getAccessTokenExpiresAt(), REFRESH_MARGIN);
+        refreshNotBefore = Instant.MIN;
     }
 
     private void retire(TokenSet replaced) {
@@ -240,12 +308,16 @@ final class LoginSession {
         try {
             stored = tokenStore.load();
         } catch (RuntimeException e) {
-            LOG.log(System.Logger.Level.WARNING, "Loading the saved Daktela login session failed; logging in: {0}",
-                    Redactor.of(secrets()).redact(String.valueOf(e)));
+            // Only the type: the message may quote what the store read, including tokens.
+            LOG.log(System.Logger.Level.WARNING, "Loading the saved Daktela login session failed ({0}); logging in",
+                    e.getClass().getName());
             return null;
         }
-        // A store shared by several users or instances must not resume another session.
-        if (stored == null || !owner.equals(stored.getOwner()) || stored.isRefreshTokenExpired(clock.instant())
+        // A store shared by several users or instances must not resume another session, nor this
+        // session's own tokens after it replaced them or the server ended it.
+        if (stored == null || !owner.equals(stored.getOwner())
+                || expiresWithin(stored.getRefreshTokenExpiresAt(), Duration.ZERO)
+                || retiredTokens.contains(stored.getRefreshToken())
                 || !DaktelaConnector.isHeaderSafe(stored.getAccessToken())
                 || !DaktelaConnector.isHeaderSafe(stored.getRefreshToken())) {
             return null;
