@@ -10,11 +10,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Automated releases: pushing a `vX.Y.Z` tag tests, signs and publishes to Maven Central and
   creates the GitHub release. See [RELEASING.md](RELEASING.md).
 - CI also builds and tests on JDK 25.
+- Login with a username and password: `builder().login(username, password)` instead of
+  `accessToken(...)`. The connector refreshes the short-lived access token before it expires and
+  after an HTTP 401, and logs in again when the server has ended the session. An optional
+  `TokenStore` (`builder().tokenStore(...)`) lets processes share one session.
+- `connector.healthCheck()` and `connector.ping()` check that the API is reachable and accepts the
+  credentials, using the `whoim` endpoint.
+- `connector.stream(endpoint, query)` reads all pages lazily, one page at a time.
+- `instance(...)` accepts a base URL with a path prefix, such as `https://example.com/daktela`.
 
 ### Changed
 - Jackson upgraded to 2.23.0. Maven plugins and GitHub Actions upgraded.
 - The README documents the Daktela versions that accept `AuthMethod.BEARER` and that static API
   tokens expire since Daktela 2025.2.
+- With `maxRetries(n)`, a write (`post`, `put`, `delete`) is now retried when the connection could
+  not be established, because the server never received it. This needs an `HttpClient` that does
+  not follow redirects, as the default one does.
+- An invalid JSON response no longer chains the JSON parser's exception as the cause, because its
+  message can quote the response body.
+
+### Security
+- Access tokens, refresh tokens and, during a login, the password are replaced with `***` in
+  exception messages, `getResponseBody()`, `getErrorData()` and `DaktelaResponse.getErrors()`,
+  including URL-encoded and JSON-escaped forms, in case the server echoes them.
 
 ## [1.1.0] - 2026-10-06
 
