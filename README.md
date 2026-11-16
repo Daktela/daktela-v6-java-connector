@@ -77,10 +77,22 @@ so the token is never sent in cleartext.
 
 ### Authentication Methods
 
-- `AuthMethod.HEADER` - Sends token in `X-AUTH-TOKEN` header (default)
-- `AuthMethod.BEARER` - Sends token in `Authorization: Bearer` header
+- `AuthMethod.HEADER` - Sends token in `X-AUTH-TOKEN` header (default). Every Daktela V6
+  version accepts it.
+- `AuthMethod.BEARER` - Sends token in `Authorization: Bearer` header, the method the Daktela API
+  documentation recommends. It requires Daktela 31.37.0, 32.36.0, 33.14.0 or later; older
+  versions answer HTTP 401.
 - `AuthMethod.QUERY` - Sends token as `accessToken` query parameter. Avoid where possible: the
   token becomes part of every URL and can end up in proxy and server logs.
+
+### Access tokens
+
+Use a static API token for integrations. An administrator creates it in
+Manage → Users → [user detail] → Persistent API tokens.
+
+Since Daktela 2025.2 static tokens expire (after up to 720 days, optionally extended on each
+use). An expired, deactivated or deleted token makes every request fail with
+`DaktelaUnauthorizedException`, so check the expiration date when you set up an integration.
 
 ### Retries
 
