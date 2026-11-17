@@ -65,6 +65,8 @@ final class LoginSession {
     /** After a failed login: when the next one may be sent, and the failure to report until then. */
     private Instant loginNotBefore = Instant.MIN;
     private DaktelaException lastLoginFailure;
+    /** Logins interrupted in a row since the last completed one. */
+    private int interruptedLogins;
 
     LoginSession(String username, String password, String owner, TokenStore tokenStore, Clock clock) {
         this.username = username;
@@ -194,8 +196,9 @@ final class LoginSession {
             response = transport.post("login", payload, password);
         } catch (DaktelaException e) {
             int status = e.getStatusCode();
-            if (e.getCause() instanceof InterruptedException) {
-                // The caller gave up; that says nothing about the server.
+            if (e.getCause() instanceof InterruptedException && ++interruptedLogins < 2) {
+                // One caller giving up should not make every other caller wait. The server may still
+                // have received the login, though, so repeated interruptions do start the cool-down.
                 throw e;
             }
             if (status == 400 || status == 401 || status == 403) {
@@ -228,6 +231,7 @@ final class LoginSession {
         }
         loginNotBefore = Instant.MIN;
         lastLoginFailure = null;
+        interruptedLogins = 0;
         use(received, true);
         saveTokens();
     }

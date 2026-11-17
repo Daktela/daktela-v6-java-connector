@@ -735,6 +735,30 @@ class LoginSessionHttpTest extends HttpTestSupport {
     }
 
     @Test
+    void repeatedlyInterruptedLoginsStartTheCoolDown() {
+        // A server that answers failed logins slowly and a caller that times out must not
+        // turn into an unthrottled stream of password attempts.
+        tokens(access1, refresh1);
+        ok();
+        DaktelaConnector connector = loginBuilder().httpClient(new FailingHttpClient(new InterruptedException(), 2,
+                HttpClient.newHttpClient(), HttpClient.Redirect.NEVER)).build();
+
+        for (int i = 0; i < 2; i++) {
+            try {
+                assertThrows(DaktelaException.class, () -> connector.get("tickets"));
+            } finally {
+                Thread.interrupted();
+            }
+        }
+        DaktelaException coolingDown = assertThrows(DaktelaException.class, () -> connector.get("tickets"));
+        assertTrue(coolingDown.getMessage().contains("failed recently"), coolingDown.getMessage());
+        assertTrue(requests.isEmpty());
+
+        clock.advance(LoginSession.LOGIN_RETRY_DELAY);
+        assertTrue(connector.get("tickets").isSuccess());
+    }
+
+    @Test
     void hugeRetryAfterOnALoginIsCapped() {
         replies.add(new Reply(429, "", Map.of("Retry-After", "99999999999999999")));
         DaktelaConnector connector = loginBuilder().build();
