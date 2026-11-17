@@ -551,6 +551,18 @@ class DaktelaConnectorHttpTest extends HttpTestSupport {
     }
 
     @Test
+    void staticTokenWithARedirectFollowingClientLogsAWarning() {
+        HttpClient redirecting = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build();
+
+        List<String> log = logOf(() -> builder().httpClient(redirecting).build());
+
+        assertEquals(1, log.size(), log.toString());
+        assertTrue(log.get(0).startsWith("WARNING The HttpClient follows redirects (NORMAL)"), log.get(0));
+        assertFalse(log.get(0).contains("secret-token"), log.get(0));
+        assertTrue(logOf(() -> builder().build()).isEmpty());
+    }
+
+    @Test
     void writesAreRetriedOnAConnectTimeout() {
         FailingHttpClient client = new FailingHttpClient(new HttpConnectTimeoutException("HTTP connect timed out"),
                 HttpClient.Redirect.NEVER);

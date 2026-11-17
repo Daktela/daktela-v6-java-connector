@@ -73,7 +73,8 @@ DaktelaConnector connector = DaktelaConnector.builder()
 
 A custom `HttpClient` should not follow redirects (the default one does not): a client that follows
 them sends the `X-AUTH-TOKEN` header or the `accessToken` parameter to the redirect target, even on
-another host.
+another host. The connector logs a warning when it is built with such a client, and a future major
+version will refuse it.
 
 `instance` accepts `my.daktela.com`, `https://my.daktela.com` or `https://my.daktela.com/`;
 `https://` is assumed when no scheme is given. A base URL may have a path prefix for an instance
@@ -116,7 +117,8 @@ server rejects the login (HTTP 400, 401 or 403, or an answer without tokens), th
 further login requests, because repeated attempts could lock the account. Later requests on that
 connector fail with the same status, so create a new connector with valid credentials. After a
 rate-limited login it waits for `Retry-After`, and after a server or network error 10 seconds,
-before it sends the password again; requests in the meantime fail without contacting the server.
+doubling with each failure in a row up to 5 minutes, before it sends the password again; requests
+in the meantime fail without contacting the server.
 
 Accounts with two-factor authentication cannot log in this way; use an access token for them.
 `login(...)` cannot be combined with `accessToken(...)`, or with an `HttpClient` that follows

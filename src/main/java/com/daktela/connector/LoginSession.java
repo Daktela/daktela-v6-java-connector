@@ -29,8 +29,13 @@ final class LoginSession {
     static final Duration REFRESH_MARGIN = Duration.ofSeconds(60);
     /** How long to wait before trying again after a refresh failed while the token was still valid. */
     static final Duration REFRESH_RETRY_DELAY = Duration.ofSeconds(15);
-    /** How long to wait before logging in again after a login failed for a reason other than rejection. */
+    /**
+     * How long to wait before logging in again after a login failed for a reason other than
+     * rejection. It doubles with each failure in a row, up to {@link #MAX_LOGIN_BACKOFF}.
+     */
     static final Duration LOGIN_RETRY_DELAY = Duration.ofSeconds(10);
+    /** The longest wait after failed logins in a row, unless the server asks for more. */
+    static final Duration MAX_LOGIN_BACKOFF = Duration.ofMinutes(5);
     /** The longest wait a Retry-After of a rate-limited login can impose. */
     static final Duration MAX_LOGIN_RETRY_DELAY = Duration.ofHours(1);
 
@@ -67,6 +72,11 @@ final class LoginSession {
     private DaktelaException lastLoginFailure;
     /** Logins interrupted in a row since the last completed one. */
     private int interruptedLogins;
+    /** Logins that failed in a row, other than rejections, since the last successful one. */
+    private int failedLogins;
+    /** Refresh attempts finished so far, and the failure of the last one (null after a success). */
+    private volatile long refreshAttempts;
+    private DaktelaException lastRefreshFailure;
 
     LoginSession(String username, String password, String owner, TokenStore tokenStore, Clock clock) {
         this.username = username;
@@ -80,6 +90,7 @@ final class LoginSession {
      * Returns the access token to send, logging in or refreshing it first when needed.
      */
     String accessToken(Transport transport) {
+        long attemptsSeen = refreshAttempts;
         TokenSet current = tokens;
         if (current != null && !expiresSoon(current)) {
             return current.getAccessToken();
@@ -91,7 +102,7 @@ final class LoginSession {
             }
             if (expiresSoon(tokens)) {
                 try {
-                    refresh(transport);
+                    refreshUnlessJustFailed(transport, attemptsSeen);
                 } catch (DaktelaException e) {
                     TokenSet left = tokens;
                     if (left == null || expiresWithin(left.getAccessTokenExpiresAt(), Duration.ZERO)) {
@@ -128,18 +139,41 @@ final class LoginSession {
      * unless another thread has already replaced that token.
      */
     void refreshAfterUnauthorized(String rejectedToken, Transport transport) {
+        long attemptsSeen = refreshAttempts;
         synchronized (lock) {
             TokenSet current = tokens;
             if (current == null || current.getAccessToken().equals(rejectedToken)) {
-                refresh(transport);
+                refreshUnlessJustFailed(transport, attemptsSeen);
             }
         }
     }
 
     /** Refreshes the session now, for example when the server has ended it without answering 401. */
     void refreshNow(Transport transport) {
+        long attemptsSeen = refreshAttempts;
         synchronized (lock) {
+            refreshUnlessJustFailed(transport, attemptsSeen);
+        }
+    }
+
+    /**
+     * Refreshes the session, unless a refresh that another thread attempted while this one waited
+     * for the lock has failed: trying again at once would make every waiting caller wait for the
+     * same failure in turn. Called under the lock.
+     */
+    private void refreshUnlessJustFailed(Transport transport, long attemptsSeen) {
+        DaktelaException failure = lastRefreshFailure;
+        if (refreshAttempts != attemptsSeen && failure != null) {
+            throw failedRecently("Refreshing the access token failed just now", failure, null);
+        }
+        try {
             refresh(transport);
+            lastRefreshFailure = null;
+        } catch (DaktelaException e) {
+            lastRefreshFailure = e;
+            throw e;
+        } finally {
+            refreshAttempts++;
         }
     }
 
@@ -205,17 +239,7 @@ final class LoginSession {
                 // Rejected credentials or a blocked account: repeating the login could lock the account.
                 reject(e);
             } else {
-                Duration wait = e instanceof DaktelaRateLimitException
-                        && ((DaktelaRateLimitException) e).getRetryAfter() != null
-                        ? ((DaktelaRateLimitException) e).getRetryAfter()
-                        : LOGIN_RETRY_DELAY;
-                // Bounded, so that a huge Retry-After cannot overflow the clock.
-                if (wait.compareTo(MAX_LOGIN_RETRY_DELAY) > 0) {
-                    wait = MAX_LOGIN_RETRY_DELAY;
-                } else if (wait.compareTo(LOGIN_RETRY_DELAY) < 0) {
-                    wait = LOGIN_RETRY_DELAY;
-                }
-                loginNotBefore = clock.instant().plus(wait);
+                loginNotBefore = clock.instant().plus(loginBackoff(e));
                 lastLoginFailure = e;
             }
             throw e;
@@ -232,6 +256,7 @@ final class LoginSession {
         loginNotBefore = Instant.MIN;
         lastLoginFailure = null;
         interruptedLogins = 0;
+        failedLogins = 0;
         use(received, true);
         saveTokens();
     }
@@ -243,13 +268,40 @@ final class LoginSession {
         tokens = null;
     }
 
-    private DaktelaException coolingDown(Duration remaining) {
-        String message = "Logging in failed recently (" + lastLoginFailure.getMessage() + "); the next login is sent in "
-                + Math.max(1, remaining.toSeconds()) + " s";
-        if (lastLoginFailure instanceof DaktelaRateLimitException) {
-            return new DaktelaRateLimitException(message, remaining, null, null);
+    /**
+     * How long to wait after a login that failed without being rejected: 10 s, doubling with each
+     * failure in a row up to 5 minutes, or longer when the server asks for it with Retry-After
+     * (up to an hour, so that a huge value cannot overflow the clock).
+     */
+    private Duration loginBackoff(DaktelaException e) {
+        failedLogins++;
+        Duration backoff = LOGIN_RETRY_DELAY.multipliedBy(1L << Math.min(failedLogins - 1, 5));
+        if (backoff.compareTo(MAX_LOGIN_BACKOFF) > 0) {
+            backoff = MAX_LOGIN_BACKOFF;
         }
-        return new DaktelaException(message, lastLoginFailure.getStatusCode(), lastLoginFailure);
+        Duration retryAfter = e instanceof DaktelaRateLimitException ? ((DaktelaRateLimitException) e).getRetryAfter() : null;
+        if (retryAfter != null && retryAfter.compareTo(backoff) > 0) {
+            backoff = retryAfter.compareTo(MAX_LOGIN_RETRY_DELAY) > 0 ? MAX_LOGIN_RETRY_DELAY : retryAfter;
+        }
+        return backoff;
+    }
+
+    private DaktelaException coolingDown(Duration remaining) {
+        return failedRecently("Logging in failed recently", lastLoginFailure, remaining);
+    }
+
+    /**
+     * A new exception for a recent failure that is reported again without sending a request. It
+     * keeps the kind and status of the original, which is chained as the cause.
+     */
+    private static DaktelaException failedRecently(String what, DaktelaException last, Duration remaining) {
+        String message = what + " (" + last.getMessage() + ")"
+                + (remaining != null ? "; the next login is sent in " + Math.max(1, remaining.toSeconds()) + " s" : "");
+        if (last instanceof DaktelaRateLimitException) {
+            return new DaktelaRateLimitException(message,
+                    remaining != null ? remaining : ((DaktelaRateLimitException) last).getRetryAfter(), null, null);
+        }
+        return new DaktelaException(message, last.getStatusCode(), last);
     }
 
     private void refresh(Transport transport) {

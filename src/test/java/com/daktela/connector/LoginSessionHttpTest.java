@@ -13,7 +13,6 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.net.http.HttpClient;
-import java.text.MessageFormat;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -25,9 +24,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.logging.Handler;
-import java.util.logging.LogRecord;
-import java.util.logging.Logger;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -85,34 +82,6 @@ class LoginSessionHttpTest extends HttpTestSupport {
         } finally {
             pool.shutdownNow();
         }
-    }
-
-    /** Runs the task and returns the log messages the connector wrote meanwhile. */
-    private static List<String> logOf(Runnable task) {
-        Logger logger = Logger.getLogger(DaktelaConnector.class.getName());
-        List<String> messages = Collections.synchronizedList(new ArrayList<>());
-        Handler handler = new Handler() {
-            @Override
-            public void publish(LogRecord record) {
-                Object[] params = record.getParameters() == null ? new Object[0] : record.getParameters();
-                messages.add(MessageFormat.format(record.getMessage(), params));
-            }
-
-            @Override
-            public void flush() {
-            }
-
-            @Override
-            public void close() {
-            }
-        };
-        logger.addHandler(handler);
-        try {
-            task.run();
-        } finally {
-            logger.removeHandler(handler);
-        }
-        return messages;
     }
 
     private List<String> paths() {
@@ -530,10 +499,10 @@ class LoginSessionHttpTest extends HttpTestSupport {
         tokens(access1, refresh1);
         DaktelaConnector connector = loginBuilder().build();
 
-        concurrently(8, () -> connector.get("tickets"));
+        concurrently(16, () -> connector.get("tickets"));
 
         assertEquals(1, count("POST /api/v6/login.json"));
-        assertEquals(8, count("GET /api/v6/tickets.json"));
+        assertEquals(16, count("GET /api/v6/tickets.json"));
         for (Recorded request : requests.subList(1, requests.size())) {
             assertEquals(access1, request.token);
         }
@@ -548,7 +517,7 @@ class LoginSessionHttpTest extends HttpTestSupport {
         requests.clear();
         tokens(access2, refresh2);
 
-        concurrently(8, () -> connector.get("tickets"));
+        concurrently(16, () -> connector.get("tickets"));
 
         assertEquals(1, count("POST /api/v6/refreshAccessToken.json"));
         for (Recorded request : requests.subList(1, requests.size())) {
@@ -574,7 +543,103 @@ class LoginSessionHttpTest extends HttpTestSupport {
         assertEquals(List.of("login", "refreshAccessToken"), calls);
     }
 
+    @Test
+    void refreshThatFailedWhileOthersWaitedIsNotRepeatedByEach() throws Exception {
+        CountDownLatch refreshing = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicInteger refreshes = new AtomicInteger();
+        LoginSession.Transport transport = (endpoint, payload, secret) -> {
+            if (endpoint.equals("login")) {
+                return new DaktelaResponse(200, Map.of("accessToken", access1, "refreshToken", refresh1), null, null,
+                        JSON);
+            }
+            refreshes.incrementAndGet();
+            refreshing.countDown();
+            try {
+                release.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            throw new DaktelaException("Request failed (HTTP 503)", 503);
+        };
+        LoginSession session = new LoginSession("jirka", "pw", "jirka@" + instance(), null, clock);
+        session.accessToken(transport);
+        clock.advance(Duration.ofHours(2));
+
+        List<Throwable> failures = Collections.synchronizedList(new ArrayList<>());
+        List<Thread> threads = new ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+            Thread thread = new Thread(() -> {
+                try {
+                    session.accessToken(transport);
+                } catch (Throwable e) {
+                    failures.add(e);
+                }
+            });
+            threads.add(thread);
+            thread.start();
+            if (i == 0) {
+                assertTrue(refreshing.await(10, TimeUnit.SECONDS));
+            }
+        }
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        for (Thread waiting : threads.subList(1, threads.size())) {
+            while (waiting.getState() != Thread.State.BLOCKED) {
+                assertTrue(System.nanoTime() < deadline, "threads did not queue for the lock");
+                Thread.sleep(5);
+            }
+        }
+        release.countDown();
+        for (Thread thread : threads) {
+            thread.join(10_000);
+        }
+
+        assertEquals(1, refreshes.get());
+        assertEquals(5, failures.size());
+        for (Throwable failure : failures) {
+            assertEquals(503, ((DaktelaException) failure).getStatusCode());
+        }
+    }
+
     // --- Failure paths ----------------------------------------------------------------------
+
+    @Test
+    void loginBackoffDoublesWithEachFailureInARow() {
+        reply(503, "");
+        reply(503, "");
+        tokens(access1, refresh1);
+        ok();
+        DaktelaConnector connector = loginBuilder().build();
+
+        assertThrows(DaktelaException.class, () -> connector.get("tickets"));
+        clock.advance(LoginSession.LOGIN_RETRY_DELAY);
+        assertThrows(DaktelaException.class, () -> connector.get("tickets"));
+        clock.advance(LoginSession.LOGIN_RETRY_DELAY);
+        DaktelaException waiting = assertThrows(DaktelaException.class, () -> connector.get("tickets"));
+
+        assertTrue(waiting.getMessage().contains("next login is sent in 10 s"), waiting.getMessage());
+        assertEquals(2, requests.size());
+        clock.advance(LoginSession.LOGIN_RETRY_DELAY);
+        assertTrue(connector.get("tickets").isSuccess());
+        assertEquals(3, count("POST /api/v6/login.json"));
+    }
+
+    @Test
+    void failedRefreshWithAValidTokenLogsOneWarningWithoutTokens() {
+        tokens(access1, refresh1);
+        ok();
+        reply(503, "{\"error\":[\"down for " + refresh1 + "\"]}");
+        ok();
+        DaktelaConnector connector = loginBuilder().build();
+        connector.get("tickets");
+        clock.advance(Duration.ofMinutes(59).plusSeconds(30));
+
+        List<String> log = logOf(() -> connector.get("tickets"));
+
+        assertEquals(1, log.size(), log.toString());
+        assertTrue(log.get(0).startsWith("WARNING Refreshing the Daktela access token failed"), log.get(0));
+        assertFalse(log.get(0).contains(refresh1) || log.get(0).contains(access1), log.get(0));
+    }
 
     @Test
     void failedRefreshIsTriedAgainOnlyAfterAPause() {

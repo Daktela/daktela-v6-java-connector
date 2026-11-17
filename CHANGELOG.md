@@ -14,8 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `accessToken(...)`. The connector refreshes the short-lived access token before it expires and
   after an HTTP 401, and logs in again when the server has ended the session. After the server
   rejects the login (HTTP 400, 401 or 403, or an answer without tokens) it sends no further login,
-  and after a rate-limited or failed login it waits before the next one, so that it does not lock
-  the account. Accounts with two-factor authentication still need an access token. An optional
+  and after a rate-limited or failed login it waits before the next one (10 s, doubling with each
+  failure in a row up to 5 minutes, or the server's `Retry-After`), so that it does not lock the
+  account. Accounts with two-factor authentication still need an access token. An optional
   `TokenStore` (`builder().tokenStore(...)`) lets processes share one session.
 - `connector.healthCheck()` returns a `DaktelaHealthCheck` that reports whether the API is reachable
   and accepts the credentials, using the `whoim` endpoint. It never throws. `connector.ping()`
@@ -32,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not follow redirects; the default client does not follow them.
 - An invalid JSON response no longer chains the JSON parser's exception as the cause, because its
   message can quote the response body.
+
+### Deprecated
+- Building a connector with an access token and an `HttpClient` that follows redirects. Such a
+  client sends the token to redirect targets, even on other hosts, so the connector now logs a
+  warning; a future major version will refuse it. The default client does not follow redirects.
 
 ### Security
 - Access tokens, refresh tokens and, during a login, the password are replaced with `***` in

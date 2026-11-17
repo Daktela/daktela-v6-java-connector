@@ -82,6 +82,7 @@ public class DaktelaConnector {
     private static final int DEFAULT_PAGE_SIZE = 100;
     private static final int DEFAULT_MAX_PAGES = 10_000;
     private static final int MAX_CAUSES_CHECKED = 32;
+    private static final System.Logger LOG = System.getLogger(DaktelaConnector.class.getName());
     private static final int MAX_BODY_IN_MESSAGE = 500;
     private static final Duration MAX_RETRY_DELAY = Duration.ofSeconds(60);
     private static final Duration INITIAL_BACKOFF = Duration.ofMillis(500);
@@ -121,6 +122,12 @@ public class DaktelaConnector {
                 : HttpClient.newBuilder().connectTimeout(this.timeout).build();
         this.sleeper = builder.sleeper;
         this.maxPages = builder.maxPages;
+        if (session == null && httpClient.followRedirects() != HttpClient.Redirect.NEVER) {
+            // Rejecting such a client would break existing integrations; a major version will.
+            LOG.log(System.Logger.Level.WARNING, "The HttpClient follows redirects ({0}), so it sends the Daktela "
+                    + "access token to redirect targets, even on other hosts. Use a client that does not follow "
+                    + "redirects; a future major version will require one.", httpClient.followRedirects());
+        }
     }
 
     /**
@@ -1043,10 +1050,11 @@ public class DaktelaConnector {
          * Uses a custom {@link HttpClient}, for example to configure a proxy or TLS settings.
          * The connector's timeout is still applied per request.
          * <p>
-         * Prefer a client that does not follow redirects, as the default one. A client that follows
+         * Use a client that does not follow redirects, as the default one. A client that follows
          * them sends the {@code X-AUTH-TOKEN} header, or the {@code accessToken} parameter, to the
-         * redirect target, even on another host. {@link #login(String, String)} refuses such a
-         * client, and writes are not retried after a failed connection with it.
+         * redirect target, even on another host: the connector logs a warning when it is built with
+         * one, and a future major version will refuse it. {@link #login(String, String)} already
+         * refuses such a client, and writes are not retried after a failed connection with it.
          *
          * @param httpClient the HTTP client
          * @return this builder

@@ -3,6 +3,7 @@ package com.daktela.connector;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -20,6 +21,15 @@ class HealthCheckHttpTest extends HttpTestSupport {
         assertFalse(health.getLatency().isNegative());
         assertEquals("GET", lastRequest().method);
         assertEquals("/api/v6/whoim.json", lastRequest().path);
+    }
+
+    @Test
+    void latencyCoversTheResponseTime() {
+        replies.add(new Reply(200, "{\"result\":{\"user\":{\"name\":\"admin\"}}}", Map.of(), 80));
+
+        Duration latency = connector().healthCheck().getLatency();
+
+        assertTrue(latency.compareTo(Duration.ofMillis(70)) >= 0, latency.toString());
     }
 
     @Test
