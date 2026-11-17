@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-17
+
 ### Security
 - `build()` now refuses an `HttpClient` that follows redirects also with an access token, as it
   already did with `login(...)`, by throwing `IllegalArgumentException`. Such a client sends the
@@ -150,7 +152,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial release: `DaktelaConnector` with GET/POST/PUT/DELETE, the query builder (fields,
   filters, sorting, pagination), the response wrapper and the exception hierarchy.
 
-[Unreleased]: https://github.com/Daktela/daktela-v6-java-connector/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/Daktela/daktela-v6-java-connector/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/Daktela/daktela-v6-java-connector/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/Daktela/daktela-v6-java-connector/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/Daktela/daktela-v6-java-connector/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/Daktela/daktela-v6-java-connector/releases/tag/v1.0.0
