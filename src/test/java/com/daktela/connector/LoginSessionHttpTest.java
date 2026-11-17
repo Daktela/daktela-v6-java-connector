@@ -1069,6 +1069,59 @@ class LoginSessionHttpTest extends HttpTestSupport {
 
     // --- Token store edge cases -------------------------------------------------------------
 
+    /** A store that returns the given sessions in turn, as other processes save newer ones. */
+    private TokenStore sharedStore(TokenSet... sessions) {
+        java.util.Iterator<TokenSet> next = List.of(sessions).iterator();
+        return new TokenStore() {
+            private TokenSet latest;
+
+            @Override
+            public TokenSet load() {
+                if (next.hasNext()) {
+                    latest = next.next();
+                }
+                return latest;
+            }
+
+            @Override
+            public void save(TokenSet tokens) {
+            }
+        };
+    }
+
+    @Test
+    void rejectedRefreshResumesANewerSessionFromTheStore() {
+        String owner = "jirka@" + instance();
+        reply(401, "");
+        reply(400, "{\"error\":[\"Invalid refresh token or token expired\"]}");
+        ok();
+
+        loginBuilder().tokenStore(sharedStore(TokenSet.of(access1, refresh1, owner), TokenSet.of(access2, refresh2, owner)))
+                .build().get("tickets");
+
+        assertEquals(List.of("GET /api/v6/tickets.json", "POST /api/v6/refreshAccessToken.json",
+                "GET /api/v6/tickets.json"), paths());
+        assertEquals(access2, lastRequest().token);
+    }
+
+    @Test
+    void expiredRefreshTokenResumesANewerSessionFromTheStore() {
+        String owner = "jirka@" + instance();
+        String shortRefresh = jwt("r1", clock.instant().plus(Duration.ofMinutes(30)));
+        ok();
+        ok();
+        DaktelaConnector connector = loginBuilder().tokenStore(sharedStore(
+                TokenSet.of(jwt("a1", clock.instant().plus(Duration.ofMinutes(20))), shortRefresh, owner),
+                TokenSet.of(access2, refresh2, owner))).build();
+        connector.get("tickets");
+
+        clock.advance(Duration.ofMinutes(31));
+        connector.get("tickets");
+
+        assertEquals(List.of("GET /api/v6/tickets.json", "GET /api/v6/tickets.json"), paths());
+        assertEquals(access2, lastRequest().token);
+    }
+
     @Test
     void storedTokensWithoutOwnerAreIgnored() {
         tokens(access2, refresh2);

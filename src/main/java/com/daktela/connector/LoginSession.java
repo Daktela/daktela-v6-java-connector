@@ -317,27 +317,30 @@ final class LoginSession {
 
     private void refresh(Transport transport) {
         TokenSet current = tokens;
-        if (current == null || expiresWithin(current.getRefreshTokenExpiresAt(), Duration.ZERO)) {
-            login(transport);
-            return;
-        }
-        TokenSet received;
-        try {
-            received = tokensFrom(transport.post("refreshAccessToken",
-                    Map.of("refresh_token", current.getRefreshToken()), null), current, "refreshAccessToken");
-        } catch (DaktelaException e) {
-            if (e.getStatusCode() != 400 && e.getStatusCode() != 401) {
-                throw e;
+        if (current != null && !expiresWithin(current.getRefreshTokenExpiresAt(), Duration.ZERO)) {
+            TokenSet received;
+            try {
+                received = tokensFrom(transport.post("refreshAccessToken",
+                        Map.of("refresh_token", current.getRefreshToken()), null), current, "refreshAccessToken");
+            } catch (DaktelaException e) {
+                if (e.getStatusCode() != 400 && e.getStatusCode() != 401) {
+                    throw e;
+                }
+                received = null;
+                // The server has ended the session; it is replaced below.
             }
-            // The server has ended the session, so its tokens are of no further use: drop them, so
-            // that requests do not keep sending them while a new login is not possible yet.
-            retire(tokens);
-            tokens = null;
-            login(transport);
-            return;
+            if (received != null) {
+                use(received, true);
+                saveTokens();
+                return;
+            }
         }
-        use(received, true);
-        saveTokens();
+        // The session cannot be refreshed. Its tokens are of no further use, so drop them: requests
+        // must not keep sending them while a new login is not possible yet. Another process sharing
+        // the token store may already have started a newer session; resume that before logging in.
+        retire(tokens);
+        tokens = null;
+        start(transport);
     }
 
     private TokenSet tokensFrom(DaktelaResponse response, TokenSet current, String endpoint) {

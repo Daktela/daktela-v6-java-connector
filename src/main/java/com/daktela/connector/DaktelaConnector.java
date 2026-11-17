@@ -82,7 +82,6 @@ public class DaktelaConnector {
     private static final int DEFAULT_PAGE_SIZE = 100;
     private static final int DEFAULT_MAX_PAGES = 10_000;
     private static final int MAX_CAUSES_CHECKED = 32;
-    private static final System.Logger LOG = System.getLogger(DaktelaConnector.class.getName());
     private static final int MAX_BODY_IN_MESSAGE = 500;
     private static final Duration MAX_RETRY_DELAY = Duration.ofSeconds(60);
     private static final Duration INITIAL_BACKOFF = Duration.ofMillis(500);
@@ -122,12 +121,6 @@ public class DaktelaConnector {
                 : HttpClient.newBuilder().connectTimeout(this.timeout).build();
         this.sleeper = builder.sleeper;
         this.maxPages = builder.maxPages;
-        if (session == null && httpClient.followRedirects() != HttpClient.Redirect.NEVER) {
-            // Rejecting such a client would break existing integrations; a major version will.
-            LOG.log(System.Logger.Level.WARNING, "The HttpClient follows redirects ({0}), so it sends the Daktela "
-                    + "access token to redirect targets, even on other hosts. Use a client that does not follow "
-                    + "redirects; a future major version will require one.", httpClient.followRedirects());
-        }
     }
 
     /**
@@ -362,11 +355,10 @@ public class DaktelaConnector {
         return idempotent && (status == 502 || status == 503 || status == 504);
     }
 
-    private boolean wasNeverSent(IOException e) {
-        // A client that follows redirects may fail to connect to a redirect target after the
-        // server has processed the request, so only a client without redirects proves it.
-        return (e instanceof ConnectException || e instanceof HttpConnectTimeoutException)
-                && httpClient.followRedirects() == HttpClient.Redirect.NEVER;
+    private static boolean wasNeverSent(IOException e) {
+        // The client does not follow redirects (build() makes sure), so a failed connection is the
+        // connection to the instance itself, not to a redirect target after the request was processed.
+        return e instanceof ConnectException || e instanceof HttpConnectTimeoutException;
     }
 
     private static Duration backoff(int attempt) {
@@ -1033,8 +1025,7 @@ public class DaktelaConnector {
          * <p>
          * Rate-limited requests (HTTP 429) are retried for every method, honouring
          * {@code Retry-After}. A connection that could not be established is retried for every
-         * method, because the server never received the request, provided the HttpClient does not
-         * follow redirects (the default one does not). Other network errors and HTTP 502/503/504 are
+         * method, because the server never received the request. Other network errors and HTTP 502/503/504 are
          * retried for GET only, because other methods may already have taken effect. Delays grow
          * exponentially from 500 ms. A {@code Retry-After} longer than 60 seconds is not waited for:
          * the rate-limit exception is thrown instead.
@@ -1051,11 +1042,10 @@ public class DaktelaConnector {
          * Uses a custom {@link HttpClient}, for example to configure a proxy or TLS settings.
          * The connector's timeout is still applied per request.
          * <p>
-         * Use a client that does not follow redirects, as the default one. A client that follows
-         * them sends the {@code X-AUTH-TOKEN} header, or the {@code accessToken} parameter, to the
-         * redirect target, even on another host: the connector logs a warning when it is built with
-         * one, and a future major version will refuse it. {@link #login(String, String)} already
-         * refuses such a client, and writes are not retried after a failed connection with it.
+         * The client must not follow redirects ({@link HttpClient.Redirect#NEVER}, as the default
+         * one): a client that follows them sends the {@code X-AUTH-TOKEN} header, the
+         * {@code accessToken} parameter or the login password to the redirect target, even on
+         * another host. {@link #build()} refuses such a client.
          *
          * @param httpClient the HTTP client
          * @return this builder
@@ -1160,6 +1150,12 @@ public class DaktelaConnector {
                     throw new IllegalArgumentException("tokenStore(...) needs login(username, password)");
                 }
             }
+            if (httpClient != null && httpClient.followRedirects() != HttpClient.Redirect.NEVER) {
+                // It would send the token, or a login's password, to the redirect target, even on
+                // another host.
+                throw new IllegalArgumentException("The HttpClient must not follow redirects: it would send the "
+                        + "credentials to the redirect target, even on another host (use HttpClient.Redirect.NEVER)");
+            }
             if (timeout.isZero() || timeout.isNegative()) {
                 throw new IllegalArgumentException("timeout must be positive");
             }
@@ -1180,10 +1176,6 @@ public class DaktelaConnector {
             }
             if (password.isEmpty()) {
                 throw new IllegalArgumentException("password must not be empty");
-            }
-            if (httpClient != null && httpClient.followRedirects() != HttpClient.Redirect.NEVER) {
-                // A 307/308 redirect would send the credentials in the body to the redirect target.
-                throw new IllegalArgumentException("login(...) needs an HttpClient that does not follow redirects");
             }
         }
     }

@@ -71,10 +71,10 @@ DaktelaConnector connector = DaktelaConnector.builder()
     .build();
 ```
 
-A custom `HttpClient` should not follow redirects (the default one does not): a client that follows
-them sends the `X-AUTH-TOKEN` header or the `accessToken` parameter to the redirect target, even on
-another host. The connector logs a warning when it is built with such a client, and a future major
-version will refuse it.
+A custom `HttpClient` must not follow redirects (build it with `HttpClient.Redirect.NEVER`, as the
+default one): a client that follows them would send the `X-AUTH-TOKEN` header, the `accessToken`
+parameter or the login password to the redirect target, even on another host. `build()` refuses such
+a client with an `IllegalArgumentException`.
 
 `instance` accepts `my.daktela.com`, `https://my.daktela.com` or `https://my.daktela.com/`;
 `https://` is assumed when no scheme is given. A base URL may have a path prefix for an instance
@@ -126,8 +126,7 @@ without contacting the server. If a login is interrupted because its calling thr
 only that request fails; a second interruption before a login succeeds starts the same wait.
 
 Accounts with two-factor authentication cannot log in this way; use an access token for them.
-`login(...)` cannot be combined with `accessToken(...)`, or with an `HttpClient` that follows
-redirects, because the password is sent in the request body.
+`login(...)` cannot be combined with `accessToken(...)`.
 
 To share one session between processes, or keep it across restarts, pass a `TokenStore`:
 
@@ -160,7 +159,8 @@ DaktelaConnector connector = DaktelaConnector.builder()
 
 `TokenSet.of(access, refresh, owner)` restores saved tokens. The connector ignores stored tokens
 of another owner (`username@instance URL`) and tokens whose refresh token has expired, and logs in
-instead. Refresh tokens are long-lived, so store them as securely as passwords. If the store throws,
+instead. When its own session can no longer be refreshed, it first resumes a newer session from the
+store, for example one another process started, and logs in only when there is none. Refresh tokens are long-lived, so store them as securely as passwords. If the store throws,
 the connector logs a warning. If `load()` throws, it logs in; if `save()` throws, it keeps the new
 tokens in memory.
 
@@ -176,11 +176,8 @@ With `maxRetries(n)` the connector retries:
   60 s is not made: the 429 exception is thrown instead);
 - network errors and HTTP 502/503/504 for `GET` only, because a failed write may already have
   taken effect;
-- connection failures (the connection could not be established) for every method, because the
-  server never received the request. Writes (`POST`, `PUT`, `DELETE`) are retried this way only
-  with an `HttpClient` that does not follow redirects; the default client does not follow them. A
-  client that follows redirects could fail on a redirect target after the server has processed the
-  write.
+- connection failures (the connection could not be established) for every method, including
+  writes (`POST`, `PUT`, `DELETE`), because the server never received the request.
 
 Delays grow exponentially from 500 ms.
 
