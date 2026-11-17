@@ -17,14 +17,14 @@ Java SDK for [Daktela V6 REST API](https://www.daktela.com/).
 <dependency>
     <groupId>com.daktela</groupId>
     <artifactId>daktela-v6-java-connector</artifactId>
-    <version>1.1.0</version>
+    <version>1.2.0</version>
 </dependency>
 ```
 
 ### Gradle
 
 ```groovy
-implementation 'com.daktela:daktela-v6-java-connector:1.1.0'
+implementation 'com.daktela:daktela-v6-java-connector:1.2.0'
 ```
 
 ## Quick Start

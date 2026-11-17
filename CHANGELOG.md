@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-17
+
 ### Added
 - Login with a username and password: `builder().login(username, password)` instead of
   `accessToken(...)`. The connector refreshes the short-lived access token before it expires and
@@ -24,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Jackson upgraded to 2.23.0.
+- Tested on JDK 11, 17, 21 and 25.
 - With `maxRetries(n)`, a write (`post`, `put`, `delete`) is now retried when the connection could
   not be established, because the server never received it. This needs an `HttpClient` that does
   not follow redirects; the default client does not follow them.
@@ -134,6 +137,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial release: `DaktelaConnector` with GET/POST/PUT/DELETE, the query builder (fields,
   filters, sorting, pagination), the response wrapper and the exception hierarchy.
 
-[Unreleased]: https://github.com/Daktela/daktela-v6-java-connector/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/Daktela/daktela-v6-java-connector/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/Daktela/daktela-v6-java-connector/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/Daktela/daktela-v6-java-connector/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/Daktela/daktela-v6-java-connector/releases/tag/v1.0.0
