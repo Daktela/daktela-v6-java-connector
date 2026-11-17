@@ -709,6 +709,46 @@ class LoginSessionHttpTest extends HttpTestSupport {
     }
 
     @Test
+    void interruptedLoginDoesNotStartTheCoolDown() {
+        tokens(access1, refresh1);
+        ok();
+        DaktelaConnector connector = loginBuilder().httpClient(new FailingHttpClient(new InterruptedException(), 1,
+                HttpClient.newHttpClient(), HttpClient.Redirect.NEVER)).build();
+
+        try {
+            DaktelaException e = assertThrows(DaktelaException.class, () -> connector.get("tickets"));
+            assertTrue(e.getCause() instanceof InterruptedException);
+        } finally {
+            Thread.interrupted();
+        }
+
+        assertTrue(connector.get("tickets").isSuccess());
+        assertEquals(List.of("POST /api/v6/login.json", "GET /api/v6/tickets.json"), paths());
+    }
+
+    @Test
+    void expiryAtTheStartOfTimeDoesNotBreakTheSession() {
+        tokens(jwt("a1", java.time.Instant.MIN), refresh1);
+        ok();
+
+        assertTrue(loginBuilder().build().get("tickets").isSuccess());
+    }
+
+    @Test
+    void hugeRetryAfterOnALoginIsCapped() {
+        replies.add(new Reply(429, "", Map.of("Retry-After", "99999999999999999")));
+        DaktelaConnector connector = loginBuilder().build();
+
+        assertThrows(DaktelaRateLimitException.class, () -> connector.get("tickets"));
+        DaktelaRateLimitException waiting = assertThrows(DaktelaRateLimitException.class,
+                () -> connector.get("tickets"));
+
+        assertEquals(LoginSession.MAX_LOGIN_RETRY_DELAY, waiting.getRetryAfter());
+        assertEquals(1, requests.size());
+        assertFalse(connector.healthCheck().isHealthy());
+    }
+
+    @Test
     void loginForbiddenIsNotRepeated() {
         reply(403, "");
         DaktelaConnector connector = loginBuilder().build();
@@ -728,6 +768,7 @@ class LoginSessionHttpTest extends HttpTestSupport {
         DaktelaException again = assertThrows(DaktelaException.class, () -> connector.get("tickets"));
 
         assertTrue(again.getMessage().contains("rejected the login"), again.getMessage());
+        assertTrue(again.getMessage().contains("does not contain an access token"), again.getMessage());
         assertEquals(1, requests.size());
     }
 

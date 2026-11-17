@@ -34,15 +34,19 @@ import java.time.LocalDateTime;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Deque;
+import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Objects;
+import java.util.Set;
 import java.util.Spliterator;
 import java.util.Spliterators;
 import java.util.stream.Collectors;
@@ -77,6 +81,7 @@ public class DaktelaConnector {
     private static final String JSON_SUFFIX = ".json";
     private static final int DEFAULT_PAGE_SIZE = 100;
     private static final int DEFAULT_MAX_PAGES = 10_000;
+    private static final int MAX_CAUSES_CHECKED = 32;
     private static final int MAX_BODY_IN_MESSAGE = 500;
     private static final Duration MAX_RETRY_DELAY = Duration.ofSeconds(60);
     private static final Duration INITIAL_BACKOFF = Duration.ofMillis(500);
@@ -570,12 +575,7 @@ public class DaktelaConnector {
      * with the secret replaced and without the chain. The kind decides whether a write is retried.
      */
     private static IOException withoutSecrets(IOException e, Redactor redactor) {
-        boolean leaks = false;
-        for (Throwable t = e; t != null && !leaks; t = t.getCause()) {
-            String message = t.getMessage();
-            leaks = message != null && !message.equals(redactor.redact(message));
-        }
-        if (!leaks) {
+        if (!leaksSecret(e, redactor)) {
             return e;
         }
         String message = redactor.redact(e.getMessage());
@@ -591,6 +591,35 @@ public class DaktelaConnector {
         }
         copy.setStackTrace(e.getStackTrace());
         return copy;
+    }
+
+    /**
+     * Whether the message of the exception, of a cause or of a suppressed exception contains a
+     * secret. A chain too long to check (or cyclic) counts as leaking.
+     */
+    private static boolean leaksSecret(Throwable e, Redactor redactor) {
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        Deque<Throwable> pending = new ArrayDeque<>(List.of(e));
+        while (!pending.isEmpty()) {
+            Throwable t = pending.pop();
+            if (!seen.add(t)) {
+                continue;
+            }
+            if (seen.size() > MAX_CAUSES_CHECKED) {
+                return true;
+            }
+            String message = t.getMessage();
+            if (message != null && !message.equals(redactor.redact(message))) {
+                return true;
+            }
+            if (t.getCause() != null) {
+                pending.push(t.getCause());
+            }
+            for (Throwable suppressed : t.getSuppressed()) {
+                pending.push(suppressed);
+            }
+        }
+        return false;
     }
 
     /** Redacts the access token, the session tokens and the given extra secret. */

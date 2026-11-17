@@ -165,21 +165,38 @@ abstract class HttpTestSupport {
         }
     }
 
-    /** An HttpClient whose every request fails with the given exception. */
+    /**
+     * An HttpClient whose first requests fail with the given exception (an IOException or an
+     * InterruptedException); later ones, if a delegate is given, go to the delegate.
+     */
     static final class FailingHttpClient extends HttpClient {
         final AtomicInteger calls = new AtomicInteger();
-        private final IOException failure;
+        private final Exception failure;
+        private final int failures;
+        private final HttpClient delegate;
         private final Redirect redirect;
 
         FailingHttpClient(IOException failure, Redirect redirect) {
+            this(failure, Integer.MAX_VALUE, null, redirect);
+        }
+
+        FailingHttpClient(Exception failure, int failures, HttpClient delegate, Redirect redirect) {
             this.failure = failure;
+            this.failures = failures;
+            this.delegate = delegate;
             this.redirect = redirect;
         }
 
         @Override
-        public <T> HttpResponse<T> send(HttpRequest request, HttpResponse.BodyHandler<T> handler) throws IOException {
-            calls.incrementAndGet();
-            throw failure;
+        public <T> HttpResponse<T> send(HttpRequest request, HttpResponse.BodyHandler<T> handler)
+                throws IOException, InterruptedException {
+            if (calls.incrementAndGet() > failures && delegate != null) {
+                return delegate.send(request, handler);
+            }
+            if (failure instanceof InterruptedException) {
+                throw (InterruptedException) failure;
+            }
+            throw (IOException) failure;
         }
 
         @Override

@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.net.ConnectException;
 import java.net.http.HttpClient;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 
@@ -105,6 +106,49 @@ class RedactionHttpTest extends HttpTestSupport {
         DaktelaException untouched = assertThrows(DaktelaException.class, () -> builder()
                 .httpClient(new FailingHttpClient(clean, HttpClient.Redirect.NEVER)).build().get("tickets"));
         assertSame(clean, untouched.getCause());
+    }
+
+    @Test
+    void cyclicCauseChainDoesNotHang() {
+        IOException first = new IOException("first");
+        IOException second = new IOException("second");
+        first.initCause(second);
+        second.initCause(first);
+
+        DaktelaException e = assertTimeoutPreemptively(Duration.ofSeconds(5), () -> assertThrows(
+                DaktelaException.class, () -> builder()
+                        .httpClient(new FailingHttpClient(first, HttpClient.Redirect.NEVER)).build().get("tickets")));
+
+        assertSame(first, e.getCause());
+    }
+
+    @Test
+    void causeChainTooLongToCheckIsReplaced() {
+        IOException top = new IOException("top");
+        Throwable link = top;
+        for (int i = 0; i < 40; i++) {
+            IOException next = new IOException("level " + i);
+            link.initCause(next);
+            link = next;
+        }
+        DaktelaException e = assertThrows(DaktelaException.class, () -> builder()
+                .httpClient(new FailingHttpClient(top, HttpClient.Redirect.NEVER)).build().get("tickets"));
+
+        assertNotSame(top, e.getCause());
+        assertNull(e.getCause().getCause());
+    }
+
+    @Test
+    void secretInASuppressedExceptionIsDropped() {
+        IOException failure = new IOException("connection reset");
+        failure.addSuppressed(new IOException("while sending accessToken=secret-token"));
+
+        DaktelaException e = assertThrows(DaktelaException.class, () -> builder()
+                .httpClient(new FailingHttpClient(failure, HttpClient.Redirect.NEVER)).build().get("tickets"));
+
+        assertNotSame(failure, e.getCause());
+        assertEquals(0, e.getCause().getSuppressed().length);
+        assertEquals("connection reset", e.getCause().getMessage());
     }
 
     @Test

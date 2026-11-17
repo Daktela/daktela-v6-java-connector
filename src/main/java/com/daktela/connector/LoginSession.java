@@ -31,6 +31,8 @@ final class LoginSession {
     static final Duration REFRESH_RETRY_DELAY = Duration.ofSeconds(15);
     /** How long to wait before logging in again after a login failed for a reason other than rejection. */
     static final Duration LOGIN_RETRY_DELAY = Duration.ofSeconds(10);
+    /** The longest wait a Retry-After of a rate-limited login can impose. */
+    static final Duration MAX_LOGIN_RETRY_DELAY = Duration.ofHours(1);
 
     private static final int MAX_RETIRED_TOKENS = 4;
     private static final System.Logger LOG = System.getLogger(DaktelaConnector.class.getName());
@@ -58,6 +60,8 @@ final class LoginSession {
     private volatile Instant refreshNotBefore = Instant.MIN;
     /** HTTP status of a login the server rejected, or 0. No further login is sent after one. */
     private volatile int rejectedStatus;
+    /** Why that login was rejected (already redacted). */
+    private volatile String rejectedReason;
     /** After a failed login: when the next one may be sent, and the failure to report until then. */
     private Instant loginNotBefore = Instant.MIN;
     private DaktelaException lastLoginFailure;
@@ -114,7 +118,7 @@ final class LoginSession {
 
     /** Whether the expiry is within the margin from now; false when the expiry is unknown. */
     private boolean expiresWithin(Instant expiresAt, Duration margin) {
-        return expiresAt != null && !expiresAt.minus(margin).isAfter(clock.instant());
+        return expiresAt != null && !expiresAt.isAfter(clock.instant().plus(margin));
     }
 
     /**
@@ -162,7 +166,7 @@ final class LoginSession {
     private void login(Transport transport) {
         int rejected = rejectedStatus;
         if (rejected != 0) {
-            String message = "The server rejected the login (HTTP " + rejected
+            String message = "The server rejected the login (" + rejectedReason
                     + "); build a new connector with valid credentials";
             if (rejected == 401) {
                 throw new DaktelaUnauthorizedException(message, null, null);
@@ -190,15 +194,25 @@ final class LoginSession {
             response = transport.post("login", payload, password);
         } catch (DaktelaException e) {
             int status = e.getStatusCode();
+            if (e.getCause() instanceof InterruptedException) {
+                // The caller gave up; that says nothing about the server.
+                throw e;
+            }
             if (status == 400 || status == 401 || status == 403) {
                 // Rejected credentials or a blocked account: repeating the login could lock the account.
-                reject(status);
+                reject(e);
             } else {
                 Duration wait = e instanceof DaktelaRateLimitException
                         && ((DaktelaRateLimitException) e).getRetryAfter() != null
                         ? ((DaktelaRateLimitException) e).getRetryAfter()
                         : LOGIN_RETRY_DELAY;
-                loginNotBefore = clock.instant().plus(wait.compareTo(LOGIN_RETRY_DELAY) > 0 ? wait : LOGIN_RETRY_DELAY);
+                // Bounded, so that a huge Retry-After cannot overflow the clock.
+                if (wait.compareTo(MAX_LOGIN_RETRY_DELAY) > 0) {
+                    wait = MAX_LOGIN_RETRY_DELAY;
+                } else if (wait.compareTo(LOGIN_RETRY_DELAY) < 0) {
+                    wait = LOGIN_RETRY_DELAY;
+                }
+                loginNotBefore = clock.instant().plus(wait);
                 lastLoginFailure = e;
             }
             throw e;
@@ -209,7 +223,7 @@ final class LoginSession {
         } catch (DaktelaException e) {
             // An answer without tokens, for example a second factor the connector cannot provide,
             // would be the same next time.
-            reject(e.getStatusCode());
+            reject(e);
             throw e;
         }
         loginNotBefore = Instant.MIN;
@@ -218,8 +232,9 @@ final class LoginSession {
         saveTokens();
     }
 
-    private void reject(int status) {
-        rejectedStatus = status;
+    private void reject(DaktelaException e) {
+        rejectedReason = e.getMessage();
+        rejectedStatus = e.getStatusCode();
         retire(tokens);
         tokens = null;
     }

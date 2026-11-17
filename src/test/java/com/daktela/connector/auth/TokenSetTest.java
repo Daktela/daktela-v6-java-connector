@@ -30,9 +30,8 @@ class TokenSetTest {
 
     @Test
     void expBeyondTheRangeOfInstantIsUnknown() {
-        TokenSet tokens = TokenSet.of(jwt("{\"exp\":9223372036854775807}"), "refresh", null);
-
-        assertNull(tokens.getAccessTokenExpiresAt());
+        assertNull(TokenSet.of(jwt("{\"exp\":9223372036854775807}"), "refresh", null).getAccessTokenExpiresAt());
+        assertNull(TokenSet.of(jwt("{\"exp\":-9223372036854775807}"), "refresh", null).getAccessTokenExpiresAt());
     }
 
     @Test
