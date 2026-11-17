@@ -667,6 +667,22 @@ class LoginSessionHttpTest extends HttpTestSupport {
     // --- Failure paths ----------------------------------------------------------------------
 
     @Test
+    void endedSessionIsNotUsedWhileTheNextLoginWaits() {
+        tokens(access1, refresh1);
+        reply(401, "");
+        reply(400, "{\"error\":[\"Invalid refresh token or token expired\"]}");
+        reply(503, "");
+        DaktelaConnector connector = loginBuilder().build();
+
+        assertEquals(503, assertThrows(DaktelaException.class, () -> connector.get("tickets")).getStatusCode());
+        int sent = requests.size();
+        DaktelaException waiting = assertThrows(DaktelaException.class, () -> connector.get("tickets"));
+
+        assertEquals(sent, requests.size());
+        assertTrue(waiting.getMessage().contains("failed recently"), waiting.getMessage());
+    }
+
+    @Test
     void loginBackoffDoublesWithEachFailureInARow() {
         reply(503, "");
         reply(503, "");

@@ -329,7 +329,10 @@ final class LoginSession {
             if (e.getStatusCode() != 400 && e.getStatusCode() != 401) {
                 throw e;
             }
-            // The server has ended the session.
+            // The server has ended the session, so its tokens are of no further use: drop them, so
+            // that requests do not keep sending them while a new login is not possible yet.
+            retire(tokens);
+            tokens = null;
             login(transport);
             return;
         }
