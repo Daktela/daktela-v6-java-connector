@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - When a login session can no longer be refreshed (its refresh token expired, or the server
   rejected it), the connector first resumes a newer session from the `TokenStore`, for example one
-  that another process started, and logs in only when there is none.
+  that another process started, and logs in only when there is none. If the server has ended the
+  resumed session too, the request is refreshed once more and logs in, instead of failing.
 
 ## [1.2.0] - 2026-11-17
 

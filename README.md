@@ -157,12 +157,12 @@ DaktelaConnector connector = DaktelaConnector.builder()
     .build();
 ```
 
-`TokenSet.of(access, refresh, owner)` restores saved tokens. The connector ignores stored tokens
-of another owner (`username@instance URL`) and tokens whose refresh token has expired, and logs in
+`TokenSet.of(access, refresh, owner)` restores saved tokens. The connector ignores stored tokens of
+another owner (`username@instance URL`) and tokens whose refresh token has expired, and logs in
 instead. When its own session can no longer be refreshed, it first resumes a newer session from the
-store, for example one another process started, and logs in only when there is none. Refresh tokens are long-lived, so store them as securely as passwords. If the store throws,
-the connector logs a warning. If `load()` throws, it logs in; if `save()` throws, it keeps the new
-tokens in memory.
+store, for example one another process started, and logs in only when there is none. Refresh tokens
+are long-lived, so store them as securely as passwords. If the store throws, the connector logs a
+warning. If `load()` throws, it logs in; if `save()` throws, it keeps the new tokens in memory.
 
 The owner check is not authentication: the password is not checked against stored tokens, so a
 connector built with the right username and any password resumes the stored session. Give each

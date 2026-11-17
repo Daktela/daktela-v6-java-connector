@@ -82,6 +82,7 @@ public class DaktelaConnector {
     private static final int DEFAULT_PAGE_SIZE = 100;
     private static final int DEFAULT_MAX_PAGES = 10_000;
     private static final int MAX_CAUSES_CHECKED = 32;
+    private static final int MAX_REAUTHENTICATIONS = 2;
     private static final int MAX_BODY_IN_MESSAGE = 500;
     private static final Duration MAX_RETRY_DELAY = Duration.ofSeconds(60);
     private static final Duration INITIAL_BACKOFF = Duration.ofMillis(500);
@@ -204,10 +205,14 @@ public class DaktelaConnector {
         long start = System.nanoTime();
         try {
             DaktelaResponse response = get("whoim");
-            if (session != null && hasNullUser(response)) {
+            for (int i = 0; i < MAX_REAUTHENTICATIONS && session != null && hasNullUser(response); i++) {
                 // whoim answers a session the server has ended with a null user instead of HTTP 401.
-                session.refreshNow(this::postCredentials);
+                // A session resumed from the token store may have been ended too: one more try.
+                boolean resumed = session.refreshNow(this::postCredentials);
                 response = get("whoim");
+                if (!resumed) {
+                    break;
+                }
             }
             boolean healthy = identifiesUser(response);
             return new DaktelaHealthCheck(healthy, Duration.ofNanos(System.nanoTime() - start),
@@ -301,7 +306,8 @@ public class DaktelaConnector {
     private DaktelaResponse execute(String method, String endpoint, DaktelaQuery query, Map<String, Object> body) {
         String url = buildUrl(endpoint, query);
         boolean idempotent = "GET".equals(method);
-        boolean reauthenticated = false;
+        int reauthentications = 0;
+        boolean mayReauthenticate = true;
         int retries = 0;
         while (true) {
             String token = currentAccessToken();
@@ -309,12 +315,14 @@ public class DaktelaConnector {
             try {
                 return send(request, null, false);
             } catch (DaktelaUnauthorizedException e) {
-                if (session == null || reauthenticated) {
+                if (session == null || !mayReauthenticate) {
                     throw e;
                 }
-                // The server answers 401 before it processes a request, so sending it once more is safe.
-                session.refreshAfterUnauthorized(token, this::postCredentials);
-                reauthenticated = true;
+                // The server answers 401 before it processes a request, so sending it once more is
+                // safe. A session resumed from the token store may have been ended too, so a request
+                // rejected with one gets a second refresh, but no more.
+                boolean resumed = session.refreshAfterUnauthorized(token, this::postCredentials);
+                mayReauthenticate = resumed && ++reauthentications < MAX_REAUTHENTICATIONS;
             } catch (DaktelaRateLimitException e) {
                 // A 429 means the request was not processed, so retrying is safe for every method.
                 Duration delay = e.getRetryAfter() != null ? e.getRetryAfter() : backoff(retries);
@@ -1025,10 +1033,10 @@ public class DaktelaConnector {
          * <p>
          * Rate-limited requests (HTTP 429) are retried for every method, honouring
          * {@code Retry-After}. A connection that could not be established is retried for every
-         * method, because the server never received the request. Other network errors and HTTP 502/503/504 are
-         * retried for GET only, because other methods may already have taken effect. Delays grow
-         * exponentially from 500 ms. A {@code Retry-After} longer than 60 seconds is not waited for:
-         * the rate-limit exception is thrown instead.
+         * method, because the server never received the request. Other network errors and HTTP
+         * 502/503/504 are retried for GET only, because other methods may already have taken
+         * effect. Delays grow exponentially from 500 ms. A {@code Retry-After} longer than 60
+         * seconds is not waited for: the rate-limit exception is thrown instead.
          *
          * @param maxRetries number of retries, must not be negative
          * @return this builder
