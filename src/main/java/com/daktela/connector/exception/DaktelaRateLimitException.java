@@ -24,7 +24,9 @@ public class DaktelaRateLimitException extends DaktelaException {
     }
 
     /**
-     * Returns how long the server asked the client to wait, from the {@code Retry-After} header.
+     * Returns how long the server asked the client to wait, from the {@code Retry-After} header. For
+     * a login that is not sent because an earlier login was rate-limited, it is the time left until
+     * the next login may be sent.
      *
      * @return the wait duration, or null if the server did not say
      */

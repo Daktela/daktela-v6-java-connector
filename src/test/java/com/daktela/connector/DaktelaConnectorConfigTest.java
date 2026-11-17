@@ -27,6 +27,23 @@ class DaktelaConnectorConfigTest {
         assertEquals("https://my.daktela.com", DaktelaConnector.normalizeBaseUrl(instance));
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "https://example.com/daktela",
+            "https://example.com/daktela/",
+            "example.com/daktela",
+            "https://example.com/daktela/api/v6",
+            "https://example.com/daktela/API/V6/"
+    })
+    void instancePathPrefixIsKept(String instance) {
+        assertEquals("https://example.com/daktela", DaktelaConnector.normalizeBaseUrl(instance));
+    }
+
+    @Test
+    void instancePathPrefixKeepsItsEncoding() {
+        assertEquals("https://example.com/my%20daktela", DaktelaConnector.normalizeBaseUrl("https://example.com/my%20daktela"));
+    }
+
     @Test
     void instanceWithPortIsKept() {
         assertEquals("https://my.daktela.com:8443", DaktelaConnector.normalizeBaseUrl("my.daktela.com:8443"));
@@ -48,7 +65,10 @@ class DaktelaConnectorConfigTest {
             "my.daktela.com?x=1",
             "my.daktela.com#frag",
             "https://user:pass@my.daktela.com",
-            "https://my.daktela.com/some/path",
+            "https://my.daktela.com/a/../b",
+            "https://my.daktela.com/a/./b",
+            "https://my.daktela.com/a/%2e%2E/b",
+            "https://my.daktela.com/a//b",
             "not a host"
     })
     void invalidInstancesAreRejected(String instance) {

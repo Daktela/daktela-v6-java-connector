@@ -1,7 +1,8 @@
 package com.daktela.connector.exception;
 
 /**
- * Exception thrown when the access token lacks permission for the request (HTTP 403).
+ * Exception thrown when the access token lacks permission for the request (HTTP 403). It is also
+ * thrown by a connector built with {@code login(...)} after the server rejected the login with HTTP 403.
  */
 public class DaktelaForbiddenException extends DaktelaException {
 

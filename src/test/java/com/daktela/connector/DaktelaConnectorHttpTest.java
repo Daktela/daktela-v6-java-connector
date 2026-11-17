@@ -9,28 +9,23 @@ import com.daktela.connector.query.DaktelaFilter;
 import com.daktela.connector.query.DaktelaQuery;
 import com.daktela.connector.query.DaktelaSort;
 import com.fasterxml.jackson.core.type.TypeReference;
-import com.sun.net.httpserver.HttpServer;
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.InetSocketAddress;
-import java.net.URLDecoder;
-import java.nio.charset.StandardCharsets;
+import java.net.ConnectException;
+import java.net.http.HttpClient;
+import java.net.http.HttpConnectTimeoutException;
+import java.net.http.HttpTimeoutException;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -38,62 +33,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * Exercises the connector against a local HTTP server to pin down the exact wire format
  * and response handling.
  */
-class DaktelaConnectorHttpTest {
-
-    private HttpServer server;
-    private final Deque<Reply> replies = new ArrayDeque<>();
-    private final List<Recorded> requests = Collections.synchronizedList(new ArrayList<>());
-    private final List<Duration> sleeps = new ArrayList<>();
-
-    @BeforeEach
-    void startServer() throws IOException {
-        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        server.createContext("/", exchange -> {
-            byte[] requestBody;
-            try (InputStream in = exchange.getRequestBody()) {
-                requestBody = in.readAllBytes();
-            }
-            requests.add(new Recorded(exchange.getRequestMethod(), exchange.getRequestURI().getRawPath(),
-                    exchange.getRequestURI().getRawQuery(), exchange.getRequestHeaders().getFirst("X-AUTH-TOKEN"),
-                    exchange.getRequestHeaders().getFirst("Content-Type"),
-                    exchange.getRequestHeaders().getFirst("User-Agent"),
-                    exchange.getRequestHeaders().getFirst("Authorization"),
-                    new String(requestBody, StandardCharsets.UTF_8)));
-            Reply reply = replies.isEmpty() ? new Reply(200, "{\"error\":[],\"result\":{\"data\":[],\"total\":0}}") : replies.poll();
-            reply.headers.forEach((k, v) -> exchange.getResponseHeaders().add(k, v));
-            byte[] body = reply.body.getBytes(StandardCharsets.UTF_8);
-            exchange.sendResponseHeaders(reply.status, body.length == 0 ? -1 : body.length);
-            try (OutputStream out = exchange.getResponseBody()) {
-                out.write(body);
-            }
-        });
-        server.start();
-    }
-
-    @AfterEach
-    void stopServer() {
-        server.stop(0);
-    }
-
-    private DaktelaConnector.Builder builder() {
-        return DaktelaConnector.builder()
-                .instance("http://127.0.0.1:" + server.getAddress().getPort())
-                .accessToken("secret-token")
-                .timeout(Duration.ofSeconds(5))
-                .sleeper(sleeps::add);
-    }
-
-    private DaktelaConnector connector() {
-        return builder().build();
-    }
-
-    private void reply(int status, String body) {
-        replies.add(new Reply(status, body));
-    }
-
-    private Recorded lastRequest() {
-        return requests.get(requests.size() - 1);
-    }
+class DaktelaConnectorHttpTest extends HttpTestSupport {
 
     // --- URL and query string ---------------------------------------------------------------
 
@@ -552,16 +492,123 @@ class DaktelaConnectorHttpTest {
     }
 
     @Test
-    void networkErrorsAreRetriedForGetOnly() {
+    void networkErrorsAreRetriedForGet() {
+        server.stop(0);
+
+        assertThrows(DaktelaException.class, () -> builder().maxRetries(2).build().get("tickets"));
+        assertEquals(List.of(Duration.ofMillis(500), Duration.ofMillis(1000)), sleeps);
+    }
+
+    @Test
+    void writesAreNotRetriedWhenTheConnectionFailsAfterSending() {
+        // The server may have processed the write before the connection broke.
+        replies.add(new Reply(CLOSE_CONNECTION, ""));
+
+        DaktelaException e = assertThrows(DaktelaException.class,
+                () -> builder().maxRetries(3).build().post("tickets", Map.of("title", "x")));
+
+        assertTrue(e.getCause() instanceof IOException);
+        assertFalse(e.getCause() instanceof java.net.ConnectException);
+        assertEquals(1, requests.size());
+        assertTrue(sleeps.isEmpty());
+    }
+
+    @Test
+    void writesAreRetriedWhenTheConnectionCannotBeEstablished() {
         server.stop(0);
         DaktelaConnector connector = builder().maxRetries(2).build();
 
-        assertThrows(DaktelaException.class, () -> connector.get("tickets"));
-        assertEquals(List.of(Duration.ofMillis(500), Duration.ofMillis(1000)), sleeps);
+        DaktelaException e = assertThrows(DaktelaException.class,
+                () -> connector.post("tickets", Map.of("title", "x")));
 
-        sleeps.clear();
+        assertTrue(e.getCause() instanceof java.net.ConnectException, String.valueOf(e.getCause()));
+        assertEquals(List.of(Duration.ofMillis(500), Duration.ofMillis(1000)), sleeps);
+    }
+
+    @Test
+    void writesAreNotRetriedOnConnectFailureWhenTheClientFollowsRedirects() {
+        // A connection failure could then come from a redirect hop, after the server processed the write.
+        server.stop(0);
+        DaktelaConnector connector = builder().maxRetries(2)
+                .httpClient(java.net.http.HttpClient.newBuilder()
+                        .followRedirects(java.net.http.HttpClient.Redirect.NORMAL).build())
+                .build();
+
         assertThrows(DaktelaException.class, () -> connector.post("tickets", Map.of("title", "x")));
         assertTrue(sleeps.isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"POST", "PUT", "DELETE"})
+    void everyWriteIsRetriedWhenTheConnectionCannotBeEstablished(String method) {
+        FailingHttpClient client = new FailingHttpClient(new ConnectException("Connection refused"), HttpClient.Redirect.NEVER);
+        DaktelaConnector connector = builder().maxRetries(2).httpClient(client).build();
+
+        assertThrows(DaktelaException.class, () -> write(connector, method));
+
+        assertEquals(3, client.calls.get());
+        assertEquals(List.of(Duration.ofMillis(500), Duration.ofMillis(1000)), sleeps);
+    }
+
+    @Test
+    void staticTokenWithARedirectFollowingClientLogsAWarning() {
+        HttpClient redirecting = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build();
+
+        List<String> log = logOf(() -> builder().httpClient(redirecting).build());
+
+        assertEquals(1, log.size(), log.toString());
+        assertTrue(log.get(0).startsWith("WARNING The HttpClient follows redirects (NORMAL)"), log.get(0));
+        assertFalse(log.get(0).contains("secret-token"), log.get(0));
+        assertTrue(logOf(() -> builder().build()).isEmpty());
+    }
+
+    @Test
+    void writesAreRetriedOnAConnectTimeout() {
+        FailingHttpClient client = new FailingHttpClient(new HttpConnectTimeoutException("HTTP connect timed out"),
+                HttpClient.Redirect.NEVER);
+
+        assertThrows(DaktelaException.class,
+                () -> builder().maxRetries(1).httpClient(client).build().post("tickets", Map.of("title", "x")));
+
+        assertEquals(2, client.calls.get());
+    }
+
+    @Test
+    void writesAreNotRetriedAfterARequestTimeout() {
+        // The request was sent; only the response did not arrive in time.
+        FailingHttpClient client = new FailingHttpClient(new HttpTimeoutException("request timed out"),
+                HttpClient.Redirect.NEVER);
+
+        assertThrows(DaktelaException.class,
+                () -> builder().maxRetries(3).httpClient(client).build().post("tickets", Map.of("title", "x")));
+
+        assertEquals(1, client.calls.get());
+        assertTrue(sleeps.isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"NORMAL", "ALWAYS"})
+    void writesAreNotRetriedOnConnectFailureWithAnyRedirectPolicy(String redirect) {
+        FailingHttpClient client = new FailingHttpClient(new ConnectException("Connection refused"),
+                HttpClient.Redirect.valueOf(redirect));
+
+        assertThrows(DaktelaException.class,
+                () -> builder().maxRetries(3).httpClient(client).build().post("tickets", Map.of("title", "x")));
+
+        assertEquals(1, client.calls.get());
+    }
+
+    private static void write(DaktelaConnector connector, String method) {
+        switch (method) {
+            case "POST":
+                connector.post("tickets", Map.of("title", "x"));
+                break;
+            case "PUT":
+                connector.put("tickets/1", Map.of("title", "x"));
+                break;
+            default:
+                connector.delete("tickets/1");
+        }
     }
 
     @Test
@@ -648,62 +695,87 @@ class DaktelaConnectorHttpTest {
         assertTrue(lastRequest().decodedParams().containsAll(List.of("take=100", "skip=0")));
     }
 
+    @Test
+    void streamFetchesPagesOnlyWhenConsumed() {
+        reply(200, "{\"result\":{\"data\":[{\"name\":\"1\"},{\"name\":\"2\"}],\"total\":5}}");
+        reply(200, "{\"result\":{\"data\":[{\"name\":\"3\"},{\"name\":\"4\"}],\"total\":5}}");
+        reply(200, "{\"result\":{\"data\":[{\"name\":\"5\"}],\"total\":5}}");
+        DaktelaConnector connector = connector();
+
+        Stream<Map<String, Object>> stream = connector.stream("tickets", DaktelaQuery.builder().take(2).build());
+        assertTrue(requests.isEmpty());
+
+        List<Object> firstThree = stream.limit(3).map(r -> r.get("name")).collect(Collectors.toList());
+
+        assertEquals(List.of("1", "2", "3"), firstThree);
+        assertEquals(2, requests.size());
+    }
+
+    @Test
+    void streamReadsEveryPage() {
+        reply(200, "{\"result\":{\"data\":[{\"name\":\"1\"},{\"name\":\"2\"}],\"total\":3}}");
+        reply(200, "{\"result\":{\"data\":[{\"name\":\"3\"}],\"total\":3}}");
+
+        long count = connector().stream("tickets", DaktelaQuery.builder().take(2).build()).count();
+
+        assertEquals(3, count);
+        assertEquals(2, requests.size());
+    }
+
+    @Test
+    void streamThrowsWhenALaterPageFails() {
+        reply(200, "{\"result\":{\"data\":[{\"name\":\"1\"},{\"name\":\"2\"}],\"total\":4}}");
+        reply(500, "{\"error\":[\"Database error\"]}");
+        List<Object> seen = new java.util.ArrayList<>();
+
+        Stream<Map<String, Object>> stream = connector().stream("tickets", DaktelaQuery.builder().take(2).build());
+        DaktelaException e = assertThrows(DaktelaException.class, () -> stream.forEach(r -> seen.add(r.get("name"))));
+
+        assertEquals(500, e.getStatusCode());
+        assertEquals(List.of("1", "2"), seen);
+    }
+
+    @Test
+    void streamStopsAtThePageLimit() {
+        for (int i = 0; i < 4; i++) {
+            reply(200, "{\"result\":{\"data\":[{\"name\":\"a\"},{\"name\":\"b\"}]}}");
+        }
+        DaktelaConnector connector = builder().maxPages(3).build();
+
+        DaktelaException e = assertThrows(DaktelaException.class,
+                () -> connector.stream("tickets", DaktelaQuery.builder().take(2).build()).count());
+
+        assertTrue(e.getMessage().contains("exceeded 3 pages"), e.getMessage());
+        assertEquals(3, requests.size());
+    }
+
+    @Test
+    void streamOfNonListDataIsEmpty() {
+        reply(200, "{\"result\":{\"name\":\"x\"}}");
+
+        assertEquals(0, connector().stream("tickets", null).count());
+        assertEquals(1, requests.size());
+    }
+
+    @Test
+    void streamRejectsAnInvalidEndpointImmediately() {
+        assertThrows(IllegalArgumentException.class, () -> connector().stream("tickets/../users", null));
+        assertTrue(requests.isEmpty());
+    }
+
+    // --- Instance with a path prefix --------------------------------------------------------
+
+    @Test
+    void instancePathPrefixIsKeptInRequests() {
+        builder().instance(instance() + "/daktela/").build().get("tickets");
+
+        assertEquals("/daktela/api/v6/tickets.json", lastRequest().path);
+    }
+
     // --- Helpers ----------------------------------------------------------------------------
 
     public static class Ticket {
         public String name;
         public LocalDateTime created;
-    }
-
-    private static final class Reply {
-        final int status;
-        final String body;
-        final Map<String, String> headers;
-
-        Reply(int status, String body) {
-            this(status, body, Map.of());
-        }
-
-        Reply(int status, String body, Map<String, String> headers) {
-            this.status = status;
-            this.body = body;
-            this.headers = headers;
-        }
-    }
-
-    private static final class Recorded {
-        final String method;
-        final String path;
-        final String query;
-        final String token;
-        final String contentType;
-        final String userAgent;
-        final String authorization;
-        final String body;
-
-        Recorded(String method, String path, String query, String token, String contentType, String userAgent,
-                 String authorization, String body) {
-            this.method = method;
-            this.path = path;
-            this.query = query;
-            this.token = token;
-            this.contentType = contentType;
-            this.userAgent = userAgent;
-            this.authorization = authorization;
-            this.body = body;
-        }
-
-        List<String> decodedParams() {
-            if (query == null || query.isEmpty()) {
-                return List.of();
-            }
-            List<String> params = new ArrayList<>();
-            for (String pair : Arrays.asList(query.split("&"))) {
-                int eq = pair.indexOf('=');
-                params.add(URLDecoder.decode(pair.substring(0, eq), StandardCharsets.UTF_8) + "="
-                        + URLDecoder.decode(pair.substring(eq + 1), StandardCharsets.UTF_8));
-            }
-            return params;
-        }
     }
 }

@@ -1,7 +1,8 @@
 package com.daktela.connector.exception;
 
 /**
- * Exception thrown when authentication fails (HTTP 401).
+ * Exception thrown when authentication fails (HTTP 401). It is also thrown by a connector built
+ * with {@code login(...)} after the server rejected the login with HTTP 401.
  */
 public class DaktelaUnauthorizedException extends DaktelaException {
 

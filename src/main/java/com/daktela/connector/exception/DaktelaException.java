@@ -5,7 +5,9 @@ package com.daktela.connector.exception;
  * <p>
  * Messages include the HTTP status and the API's error details, or an excerpt of the response
  * body when it is not API JSON. Error details can echo record data, so treat messages like any
- * other data from the API when logging them.
+ * other data from the API when logging them. Access and refresh tokens, and the password of a
+ * login, are replaced with {@code ***} in messages, the response body and the error data, in case
+ * the server echoes them.
  */
 public class DaktelaException extends RuntimeException {
 
