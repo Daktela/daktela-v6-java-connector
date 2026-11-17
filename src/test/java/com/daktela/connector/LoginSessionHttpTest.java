@@ -1069,6 +1069,162 @@ class LoginSessionHttpTest extends HttpTestSupport {
 
     // --- Token store edge cases -------------------------------------------------------------
 
+    /** A store that returns the given sessions in turn, as other processes save newer ones. */
+    private TokenStore sharedStore(TokenSet... sessions) {
+        java.util.Iterator<TokenSet> next = List.of(sessions).iterator();
+        return new TokenStore() {
+            private TokenSet latest;
+
+            @Override
+            public TokenSet load() {
+                if (next.hasNext()) {
+                    latest = next.next();
+                }
+                return latest;
+            }
+
+            @Override
+            public void save(TokenSet tokens) {
+            }
+        };
+    }
+
+    @Test
+    void rejectedRefreshResumesANewerSessionFromTheStore() {
+        String owner = "jirka@" + instance();
+        reply(401, "");
+        reply(400, "{\"error\":[\"Invalid refresh token or token expired\"]}");
+        ok();
+
+        loginBuilder().tokenStore(sharedStore(TokenSet.of(access1, refresh1, owner), TokenSet.of(access2, refresh2, owner)))
+                .build().get("tickets");
+
+        assertEquals(List.of("GET /api/v6/tickets.json", "POST /api/v6/refreshAccessToken.json",
+                "GET /api/v6/tickets.json"), paths());
+        assertEquals(access2, lastRequest().token);
+    }
+
+    @Test
+    void expiredRefreshTokenResumesANewerSessionFromTheStore() {
+        String owner = "jirka@" + instance();
+        String shortRefresh = jwt("r1", clock.instant().plus(Duration.ofMinutes(30)));
+        ok();
+        ok();
+        DaktelaConnector connector = loginBuilder().tokenStore(sharedStore(
+                TokenSet.of(jwt("a1", clock.instant().plus(Duration.ofMinutes(20))), shortRefresh, owner),
+                TokenSet.of(access2, refresh2, owner))).build();
+        connector.get("tickets");
+
+        clock.advance(Duration.ofMinutes(31));
+        connector.get("tickets");
+
+        assertEquals(List.of("GET /api/v6/tickets.json", "GET /api/v6/tickets.json"), paths());
+        assertEquals(access2, lastRequest().token);
+    }
+
+    /** A store that is empty at first and then returns what {@code sessions} yields on each load. */
+    private static TokenStore storeLater(java.util.function.Supplier<TokenSet> sessions) {
+        return new TokenStore() {
+            private int loads;
+
+            @Override
+            public TokenSet load() {
+                return loads++ == 0 ? null : sessions.get();
+            }
+
+            @Override
+            public void save(TokenSet tokens) {
+            }
+        };
+    }
+
+    @Test
+    void deadStoredSessionDoesNotFailTheRequest() {
+        // The server ended every session, including the one another process saved in the store.
+        String owner = "jirka@" + instance();
+        String access3 = jwt("a3", clock.instant().plus(Duration.ofHours(3)));
+        tokens(access1, refresh1);
+        reply(401, "");
+        reply(400, "{\"error\":[\"Invalid refresh token or token expired\"]}");
+        reply(401, "");
+        reply(400, "{\"error\":[\"Invalid refresh token or token expired\"]}");
+        tokens(access3, "refresh-three");
+        reply(201, "{\"result\":{\"name\":\"t1\"}}");
+        DaktelaConnector connector = loginBuilder()
+                .tokenStore(storeLater(() -> TokenSet.of(access2, refresh2, owner))).build();
+
+        DaktelaResponse response = connector.post("tickets", Map.of("title", "x"));
+
+        assertEquals("t1", response.getDataAsMap().get("name"));
+        assertEquals(List.of("POST /api/v6/login.json", "POST /api/v6/tickets.json",
+                "POST /api/v6/refreshAccessToken.json", "POST /api/v6/tickets.json",
+                "POST /api/v6/refreshAccessToken.json", "POST /api/v6/login.json", "POST /api/v6/tickets.json"), paths());
+        assertEquals(access2, requests.get(3).token);
+        assertEquals(access3, lastRequest().token);
+    }
+
+    @Test
+    void healthCheckSeesThroughADeadStoredSession() {
+        String owner = "jirka@" + instance();
+        String access3 = jwt("a3", clock.instant().plus(Duration.ofHours(3)));
+        tokens(access1, refresh1);
+        reply(200, "{\"result\":{\"user\":null}}");
+        reply(400, "{\"error\":[\"Invalid refresh token or token expired\"]}");
+        reply(200, "{\"result\":{\"user\":null}}");
+        reply(400, "{\"error\":[\"Invalid refresh token or token expired\"]}");
+        tokens(access3, "refresh-three");
+        reply(200, "{\"result\":{\"user\":{\"name\":\"jirka\"}}}");
+
+        DaktelaHealthCheck health = loginBuilder()
+                .tokenStore(storeLater(() -> TokenSet.of(access2, refresh2, owner))).build().healthCheck();
+
+        assertTrue(health.isHealthy(), String.valueOf(health));
+        assertEquals(7, requests.size());
+    }
+
+    @Test
+    void storeHandingOutDeadSessionsCannotLoopTheRequest() {
+        String owner = "jirka@" + instance();
+        AtomicInteger issued = new AtomicInteger();
+        tokens(access1, refresh1);
+        for (int i = 0; i < 3; i++) {
+            reply(401, "");
+            reply(400, "{\"error\":[\"Invalid refresh token or token expired\"]}");
+        }
+        DaktelaConnector connector = loginBuilder().tokenStore(storeLater(() -> TokenSet.of(
+                jwt("s" + issued.incrementAndGet(), clock.instant().plus(Duration.ofHours(1))),
+                jwt("sr" + issued.get(), clock.instant().plus(Duration.ofDays(1))), owner))).build();
+
+        assertThrows(DaktelaUnauthorizedException.class, () -> connector.get("tickets"));
+
+        assertEquals(3, count("GET /api/v6/tickets.json"));
+        assertEquals(1, count("POST /api/v6/login.json"));
+    }
+
+    @Test
+    void resumedStoredSessionNearItsExpiryIsRefreshedAtOnce() throws Exception {
+        // The refresh before expiry is rejected; the session another process saved expires soon too.
+        String owner = "jirka@" + instance();
+        String access3 = jwt("a3", clock.instant().plus(Duration.ofHours(3)));
+        tokens(access1, refresh1);
+        ok();
+        reply(400, "{\"error\":[\"Invalid refresh token or token expired\"]}");
+        tokens(access3, "refresh-three");
+        ok();
+        DaktelaConnector connector = loginBuilder().tokenStore(storeLater(() -> TokenSet.of(
+                jwt("a2", clock.instant().plusSeconds(30)), refresh2, owner))).build();
+        connector.get("tickets");
+        clock.advance(Duration.ofMinutes(59).plusSeconds(30));
+
+        assertTrue(connector.get("tickets").isSuccess());
+
+        assertEquals(List.of("POST /api/v6/login.json", "GET /api/v6/tickets.json",
+                "POST /api/v6/refreshAccessToken.json", "POST /api/v6/refreshAccessToken.json",
+                "GET /api/v6/tickets.json"), paths());
+        assertEquals(Map.of("refresh_token", refresh2), json(requests.get(3).body));
+        assertEquals(access3, lastRequest().token);
+    }
+
     @Test
     void storedTokensWithoutOwnerAreIgnored() {
         tokens(access2, refresh2);

@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- `build()` now refuses an `HttpClient` that follows redirects also with an access token, as it
+  already did with `login(...)`, by throwing `IllegalArgumentException`. Such a client sends the
+  token to the redirect target, even on another host. 1.2.0 only logged a warning and announced
+  this for the next major version; it ships in a patch release because it is a security fix. Use a
+  client built with `HttpClient.Redirect.NEVER`, as the default one.
+
+### Fixed
+- When a login session can no longer be refreshed (its refresh token expired, or the server
+  rejected it), the connector first resumes a newer session from the `TokenStore`, for example one
+  that another process started, and logs in only when there is none. If the server has ended the
+  resumed session too, the request is refreshed once more and logs in, instead of failing.
+
 ## [1.2.0] - 2026-11-17
 
 ### Added

@@ -525,19 +525,6 @@ class DaktelaConnectorHttpTest extends HttpTestSupport {
         assertEquals(List.of(Duration.ofMillis(500), Duration.ofMillis(1000)), sleeps);
     }
 
-    @Test
-    void writesAreNotRetriedOnConnectFailureWhenTheClientFollowsRedirects() {
-        // A connection failure could then come from a redirect hop, after the server processed the write.
-        server.stop(0);
-        DaktelaConnector connector = builder().maxRetries(2)
-                .httpClient(java.net.http.HttpClient.newBuilder()
-                        .followRedirects(java.net.http.HttpClient.Redirect.NORMAL).build())
-                .build();
-
-        assertThrows(DaktelaException.class, () -> connector.post("tickets", Map.of("title", "x")));
-        assertTrue(sleeps.isEmpty());
-    }
-
     @ParameterizedTest
     @ValueSource(strings = {"POST", "PUT", "DELETE"})
     void everyWriteIsRetriedWhenTheConnectionCannotBeEstablished(String method) {
@@ -550,16 +537,18 @@ class DaktelaConnectorHttpTest extends HttpTestSupport {
         assertEquals(List.of(Duration.ofMillis(500), Duration.ofMillis(1000)), sleeps);
     }
 
-    @Test
-    void staticTokenWithARedirectFollowingClientLogsAWarning() {
-        HttpClient redirecting = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build();
+    @ParameterizedTest
+    @ValueSource(strings = {"NORMAL", "ALWAYS"})
+    void clientThatFollowsRedirectsIsRefused(String redirect) {
+        // It would send the token to a redirect target, even on another host.
+        HttpClient redirecting = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.valueOf(redirect)).build();
 
-        List<String> log = logOf(() -> builder().httpClient(redirecting).build());
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> builder().httpClient(redirecting).build());
 
-        assertEquals(1, log.size(), log.toString());
-        assertTrue(log.get(0).startsWith("WARNING The HttpClient follows redirects (NORMAL)"), log.get(0));
-        assertFalse(log.get(0).contains("secret-token"), log.get(0));
-        assertTrue(logOf(() -> builder().build()).isEmpty());
+        assertTrue(e.getMessage().contains("must not follow redirects"), e.getMessage());
+        assertFalse(e.getMessage().contains("secret-token"), e.getMessage());
+        assertTrue(requests.isEmpty());
     }
 
     @Test
@@ -584,18 +573,6 @@ class DaktelaConnectorHttpTest extends HttpTestSupport {
 
         assertEquals(1, client.calls.get());
         assertTrue(sleeps.isEmpty());
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = {"NORMAL", "ALWAYS"})
-    void writesAreNotRetriedOnConnectFailureWithAnyRedirectPolicy(String redirect) {
-        FailingHttpClient client = new FailingHttpClient(new ConnectException("Connection refused"),
-                HttpClient.Redirect.valueOf(redirect));
-
-        assertThrows(DaktelaException.class,
-                () -> builder().maxRetries(3).httpClient(client).build().post("tickets", Map.of("title", "x")));
-
-        assertEquals(1, client.calls.get());
     }
 
     private static void write(DaktelaConnector connector, String method) {

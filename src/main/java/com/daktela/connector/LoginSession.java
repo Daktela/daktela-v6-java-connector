@@ -63,6 +63,8 @@ final class LoginSession {
     private volatile TokenSet tokens;
     private volatile List<String> retiredTokens = List.of();
     private volatile boolean refreshBeforeExpiry = true;
+    /** Whether the current tokens were resumed from the store rather than issued to this session. */
+    private volatile boolean resumedFromStore;
     private volatile Instant refreshNotBefore = Instant.MIN;
     /** HTTP status of a login the server rejected, or 0. No further login is sent after one. */
     private volatile int rejectedStatus;
@@ -138,22 +140,32 @@ final class LoginSession {
     /**
      * Refreshes the session after the server answered 401 to a request sent with the given token,
      * unless another thread has already replaced that token.
+     *
+     * @return whether the session now in use was resumed from the token store: the server may have
+     *         ended it too, so a request rejected with it again deserves one more refresh
      */
-    void refreshAfterUnauthorized(String rejectedToken, Transport transport) {
+    boolean refreshAfterUnauthorized(String rejectedToken, Transport transport) {
         long attemptsSeen = refreshAttempts;
         synchronized (lock) {
             TokenSet current = tokens;
             if (current == null || current.getAccessToken().equals(rejectedToken)) {
                 refreshUnlessJustFailed(transport, attemptsSeen);
             }
+            return resumedFromStore;
         }
     }
 
-    /** Refreshes the session now, for example when the server has ended it without answering 401. */
-    void refreshNow(Transport transport) {
+    /**
+     * Refreshes the session now, for example when the server has ended it without answering 401.
+     *
+     * @return whether the session now in use was resumed from the token store (see
+     *         {@link #refreshAfterUnauthorized(String, Transport)})
+     */
+    boolean refreshNow(Transport transport) {
         long attemptsSeen = refreshAttempts;
         synchronized (lock) {
             refreshUnlessJustFailed(transport, attemptsSeen);
+            return resumedFromStore;
         }
     }
 
@@ -316,28 +328,48 @@ final class LoginSession {
     }
 
     private void refresh(Transport transport) {
-        TokenSet current = tokens;
-        if (current == null || expiresWithin(current.getRefreshTokenExpiresAt(), Duration.ZERO)) {
-            login(transport);
-            return;
+        boolean storeTried = false;
+        while (true) {
+            TokenSet current = tokens;
+            if (current != null && !expiresWithin(current.getRefreshTokenExpiresAt(), Duration.ZERO)) {
+                TokenSet received = refreshed(current, transport);
+                if (received != null) {
+                    use(received, true);
+                    saveTokens();
+                    return;
+                }
+            }
+            // The session cannot be refreshed. Its tokens are of no further use, so drop them:
+            // requests must not keep sending them while a new login is not possible yet.
+            retire(tokens);
+            tokens = null;
+            // Another process sharing the token store may already have started a newer session;
+            // resume that (once) before logging in. It is not refreshed right away, as that would
+            // end the session for the process that uses it, unless its access token expires soon.
+            TokenSet stored = storeTried ? null : loadStoredTokens();
+            storeTried = true;
+            if (stored == null) {
+                login(transport);
+                return;
+            }
+            use(stored, false);
+            if (!expiresSoon(stored)) {
+                return;
+            }
         }
-        TokenSet received;
+    }
+
+    /** Refreshes the given session; returns null when the server has ended it. */
+    private TokenSet refreshed(TokenSet current, Transport transport) {
         try {
-            received = tokensFrom(transport.post("refreshAccessToken",
+            return tokensFrom(transport.post("refreshAccessToken",
                     Map.of("refresh_token", current.getRefreshToken()), null), current, "refreshAccessToken");
         } catch (DaktelaException e) {
             if (e.getStatusCode() != 400 && e.getStatusCode() != 401) {
                 throw e;
             }
-            // The server has ended the session, so its tokens are of no further use: drop them, so
-            // that requests do not keep sending them while a new login is not possible yet.
-            retire(tokens);
-            tokens = null;
-            login(transport);
-            return;
+            return null;
         }
-        use(received, true);
-        saveTokens();
     }
 
     private TokenSet tokensFrom(DaktelaResponse response, TokenSet current, String endpoint) {
@@ -368,6 +400,7 @@ final class LoginSession {
         // server. Refreshing it before every request would not help, so it is refreshed after a 401.
         refreshBeforeExpiry = !issuedNow || !expiresWithin(received.getAccessTokenExpiresAt(), REFRESH_MARGIN);
         refreshNotBefore = Instant.MIN;
+        resumedFromStore = !issuedNow;
     }
 
     private void retire(TokenSet replaced) {
