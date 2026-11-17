@@ -543,13 +543,28 @@ class LoginSessionHttpTest extends HttpTestSupport {
         assertEquals(List.of("login", "refreshAccessToken"), calls);
     }
 
-    @Test
-    void refreshThatFailedWhileOthersWaitedIsNotRepeatedByEach() throws Exception {
+    /** What a thread does with the session while another thread's refresh is under way. */
+    private interface SessionCall {
+        void run(LoginSession session, LoginSession.Transport transport);
+    }
+
+    /**
+     * Five threads use the session at the same time after its access token expired. The first
+     * one's refresh blocks until the others queue for the session lock, then fails with
+     * refreshFailure (and a fallback login, when the refresh is rejected, with loginFailure).
+     * Returns the number of refresh requests and what each thread threw.
+     */
+    private Map.Entry<Integer, List<Throwable>> contendedRefresh(DaktelaException refreshFailure,
+            DaktelaException loginFailure, SessionCall call) throws Exception {
         CountDownLatch refreshing = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
         AtomicInteger refreshes = new AtomicInteger();
+        AtomicInteger logins = new AtomicInteger();
         LoginSession.Transport transport = (endpoint, payload, secret) -> {
             if (endpoint.equals("login")) {
+                if (logins.getAndIncrement() > 0 && loginFailure != null) {
+                    throw loginFailure;
+                }
                 return new DaktelaResponse(200, Map.of("accessToken", access1, "refreshToken", refresh1), null, null,
                         JSON);
             }
@@ -560,7 +575,7 @@ class LoginSessionHttpTest extends HttpTestSupport {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
-            throw new DaktelaException("Request failed (HTTP 503)", 503);
+            throw refreshFailure;
         };
         LoginSession session = new LoginSession("jirka", "pw", "jirka@" + instance(), null, clock);
         session.accessToken(transport);
@@ -571,7 +586,7 @@ class LoginSessionHttpTest extends HttpTestSupport {
         for (int i = 0; i < 5; i++) {
             Thread thread = new Thread(() -> {
                 try {
-                    session.accessToken(transport);
+                    call.run(session, transport);
                 } catch (Throwable e) {
                     failures.add(e);
                 }
@@ -593,11 +608,59 @@ class LoginSessionHttpTest extends HttpTestSupport {
         for (Thread thread : threads) {
             thread.join(10_000);
         }
+        return Map.entry(refreshes.get(), failures);
+    }
 
-        assertEquals(1, refreshes.get());
-        assertEquals(5, failures.size());
-        for (Throwable failure : failures) {
+    @Test
+    void refreshThatFailedWhileOthersWaitedIsNotRepeatedByEach() throws Exception {
+        Map.Entry<Integer, List<Throwable>> result = contendedRefresh(
+                new DaktelaException("Request failed (HTTP 503)", 503), null, LoginSession::accessToken);
+
+        assertEquals(1, result.getKey());
+        assertEquals(5, result.getValue().size());
+        for (Throwable failure : result.getValue()) {
+            assertEquals(DaktelaException.class, failure.getClass());
             assertEquals(503, ((DaktelaException) failure).getStatusCode());
+        }
+    }
+
+    @Test
+    void waitingThreadsGetTheSameKindOfFailureForAForbiddenRefresh() throws Exception {
+        Map.Entry<Integer, List<Throwable>> result = contendedRefresh(
+                new DaktelaForbiddenException("Forbidden (HTTP 403)", null, null), null, LoginSession::accessToken);
+
+        assertEquals(1, result.getKey());
+        assertEquals(5, result.getValue().size());
+        for (Throwable failure : result.getValue()) {
+            assertEquals(DaktelaForbiddenException.class, failure.getClass());
+        }
+    }
+
+    @Test
+    void waitingThreadsGetTheSameKindOfFailureForARejectedLogin() throws Exception {
+        // Concurrent 401s: the refresh is rejected, the fallback login is rejected too.
+        Map.Entry<Integer, List<Throwable>> result = contendedRefresh(
+                new DaktelaException("Request failed (HTTP 400)", 400),
+                new DaktelaUnauthorizedException("Unauthorized (HTTP 401)", null, null),
+                (session, transport) -> session.refreshAfterUnauthorized(access1, transport));
+
+        assertEquals(1, result.getKey());
+        assertEquals(5, result.getValue().size());
+        for (Throwable failure : result.getValue()) {
+            assertEquals(DaktelaUnauthorizedException.class, failure.getClass());
+        }
+    }
+
+    @Test
+    void waitingThreadsGetTheSameKindOfFailureForARateLimitedRefresh() throws Exception {
+        Map.Entry<Integer, List<Throwable>> result = contendedRefresh(
+                new DaktelaRateLimitException("Rate limit exceeded (HTTP 429)", Duration.ofSeconds(7), null, null),
+                null, LoginSession::accessToken);
+
+        assertEquals(1, result.getKey());
+        for (Throwable failure : result.getValue()) {
+            assertEquals(DaktelaRateLimitException.class, failure.getClass());
+            assertEquals(Duration.ofSeconds(7), ((DaktelaRateLimitException) failure).getRetryAfter());
         }
     }
 

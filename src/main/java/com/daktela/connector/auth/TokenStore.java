@@ -8,8 +8,8 @@ package com.daktela.connector.auth;
  * Implement it with your cache or database, for example by saving the two tokens and the owner and
  * restoring them with {@link TokenSet#of(String, String, String)}. Refresh tokens are long-lived
  * credentials, so store them as securely as passwords. The connector calls the store from the
- * thread that sends a request; when the store throws, the connector logs a warning and continues
- * with the tokens it holds in memory.
+ * thread that sends a request. When {@link #load()} throws, the connector logs a warning and logs in;
+ * when {@link #save(TokenSet)} throws, it logs a warning and keeps the tokens in memory.
  * <p>
  * The connector checks only that saved tokens belong to the same username and instance; it does
  * not check the password against them. Whoever can build a connector that reads a store therefore

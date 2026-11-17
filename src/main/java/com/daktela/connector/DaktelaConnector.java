@@ -1036,7 +1036,8 @@ public class DaktelaConnector {
          * method, because the server never received the request, provided the HttpClient does not
          * follow redirects (the default one does not). Other network errors and HTTP 502/503/504 are
          * retried for GET only, because other methods may already have taken effect. Delays grow
-         * exponentially from 500 ms.
+         * exponentially from 500 ms. A {@code Retry-After} longer than 60 seconds is not waited for:
+         * the rate-limit exception is thrown instead.
          *
          * @param maxRetries number of retries, must not be negative
          * @return this builder
@@ -1080,8 +1081,12 @@ public class DaktelaConnector {
         /**
          * Logs in with a username and password instead of a static access token. The connector logs
          * in with the first request, refreshes the short-lived access token shortly before it expires
-         * and after an HTTP 401, and logs in again when the server has ended the session. After the
-         * server rejects the credentials it sends no further login, which could lock the account.
+         * and after an HTTP 401, and logs in again when the server has ended the session.
+         * <p>
+         * If the server rejects the credentials (HTTP 400, 401 or 403, or an answer without tokens), it
+         * sends no further login, which could lock the account. After any other failed login it waits
+         * before the next one: 10 seconds, doubling with each failure in a row up to 5 minutes, or the
+         * server's {@code Retry-After} when that is longer (up to 1 hour).
          * <p>
          * Accounts with two-factor authentication cannot log in this way; use a static token for them.
          * Use either this or {@link #accessToken(String)}.

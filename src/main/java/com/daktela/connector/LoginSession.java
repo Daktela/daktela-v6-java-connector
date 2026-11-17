@@ -4,6 +4,7 @@ import com.daktela.connector.auth.TokenSet;
 import com.daktela.connector.auth.TokenStore;
 import com.daktela.connector.exception.DaktelaException;
 import com.daktela.connector.exception.DaktelaForbiddenException;
+import com.daktela.connector.exception.DaktelaNotFoundException;
 import com.daktela.connector.exception.DaktelaRateLimitException;
 import com.daktela.connector.exception.DaktelaUnauthorizedException;
 
@@ -292,7 +293,8 @@ final class LoginSession {
 
     /**
      * A new exception for a recent failure that is reported again without sending a request. It
-     * keeps the kind and status of the original, which is chained as the cause.
+     * keeps the kind and status of the original, so that callers' handlers still match, and chains
+     * the original as the cause where the kind allows one.
      */
     private static DaktelaException failedRecently(String what, DaktelaException last, Duration remaining) {
         String message = what + " (" + last.getMessage() + ")"
@@ -300,6 +302,15 @@ final class LoginSession {
         if (last instanceof DaktelaRateLimitException) {
             return new DaktelaRateLimitException(message,
                     remaining != null ? remaining : ((DaktelaRateLimitException) last).getRetryAfter(), null, null);
+        }
+        if (last instanceof DaktelaUnauthorizedException) {
+            return new DaktelaUnauthorizedException(message, null, null);
+        }
+        if (last instanceof DaktelaForbiddenException) {
+            return new DaktelaForbiddenException(message, null, null);
+        }
+        if (last instanceof DaktelaNotFoundException) {
+            return new DaktelaNotFoundException(message, null, null);
         }
         return new DaktelaException(message, last.getStatusCode(), last);
     }

@@ -112,13 +112,18 @@ DaktelaConnector connector = DaktelaConnector.builder()
 ```
 
 The connector logs in with the first request. It refreshes the access token about 60 seconds before
-it expires and after an HTTP 401, and logs in again when the server has ended the session. If the
-server rejects the login (HTTP 400, 401 or 403, or an answer without tokens), the connector sends no
-further login requests, because repeated attempts could lock the account. Later requests on that
-connector fail with the same status, so create a new connector with valid credentials. After a
-rate-limited login it waits for `Retry-After`, and after a server or network error 10 seconds,
-doubling with each failure in a row up to 5 minutes, before it sends the password again; requests
-in the meantime fail without contacting the server.
+it expires and after an HTTP 401, and logs in again when the server has ended the session. Concurrent
+requests share one refresh. If a refresh fails while the current access token is still valid,
+requests keep using that token and the refresh is tried again after 15 seconds.
+
+If the server rejects the login (HTTP 400, 401 or 403, or an answer without tokens), the connector
+sends no further login requests, because repeated attempts could lock the account. Later requests on
+that connector fail without contacting the server, so create a new connector with valid credentials.
+After any other failed login, such as a rate limit or a server or network error, the connector waits
+before it sends the password again: 10 seconds, doubling with each failure in a row up to 5 minutes,
+or the server's `Retry-After` when that is longer (up to 1 hour). Requests in the meantime fail
+without contacting the server. If a login is interrupted because its calling thread is interrupted,
+only that request fails; a second interruption before a login succeeds starts the same wait.
 
 Accounts with two-factor authentication cannot log in this way; use an access token for them.
 `login(...)` cannot be combined with `accessToken(...)`, or with an `HttpClient` that follows
@@ -156,7 +161,8 @@ DaktelaConnector connector = DaktelaConnector.builder()
 `TokenSet.of(access, refresh, owner)` restores saved tokens. The connector ignores stored tokens
 of another owner (`username@instance URL`) and tokens whose refresh token has expired, and logs in
 instead. Refresh tokens are long-lived, so store them as securely as passwords. If the store throws,
-the connector logs a warning and continues with the tokens it holds in memory.
+the connector logs a warning. If `load()` throws, it logs in; if `save()` throws, it keeps the new
+tokens in memory.
 
 The owner check is not authentication: the password is not checked against stored tokens, so a
 connector built with the right username and any password resumes the stored session. Give each
@@ -166,7 +172,8 @@ party that holds a password its own store, for example one per tenant.
 
 With `maxRetries(n)` the connector retries:
 
-- HTTP 429 for every method, waiting for `Retry-After` when the server sends it (up to 60 s);
+- HTTP 429 for every method, waiting for `Retry-After` when the server sends it (a longer wait than
+  60 s is not made: the 429 exception is thrown instead);
 - network errors and HTTP 502/503/504 for `GET` only, because a failed write may already have
   taken effect;
 - connection failures (the connection could not be established) for every method, because the
@@ -412,9 +419,9 @@ Every failure is a `DaktelaException` (unchecked). HTTP errors map to specific s
 try {
     DaktelaResponse response = connector.post("tickets", Map.of("title", "x"));
 } catch (DaktelaUnauthorizedException e) {
-    // 401 - Invalid or expired token
+    // 401 - Invalid or expired token, or a login the server rejected
 } catch (DaktelaForbiddenException e) {
-    // 403 - Token lacks permission for this object
+    // 403 - Token lacks permission for this object, or a login the server rejected
 } catch (DaktelaNotFoundException e) {
     // 404 - Resource not found
 } catch (DaktelaRateLimitException e) {
