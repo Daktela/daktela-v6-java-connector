@@ -1045,7 +1045,9 @@ public class DaktelaConnector {
          * The client must not follow redirects ({@link HttpClient.Redirect#NEVER}, as the default
          * one): a client that follows them sends the {@code X-AUTH-TOKEN} header, the
          * {@code accessToken} parameter or the login password to the redirect target, even on
-         * another host. {@link #build()} refuses such a client.
+         * another host. {@link #build()} refuses such a client. The check relies on the client's
+         * {@link HttpClient#followRedirects()}: a client or wrapper that follows redirects itself
+         * while reporting {@code NEVER} defeats it and must not be used.
          *
          * @param httpClient the HTTP client
          * @return this builder
