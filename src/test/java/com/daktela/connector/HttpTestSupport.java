@@ -75,6 +75,9 @@ abstract class HttpTestSupport {
                 exchange.close();
                 return;
             }
+            // A fresh connection per request: on JDK 11 the client can reuse a connection that this
+            // server is closing, and a POST sent on it fails with "header parser received no bytes".
+            exchange.getResponseHeaders().add("Connection", "close");
             reply.headers.forEach((k, v) -> exchange.getResponseHeaders().add(k, v));
             byte[] body = reply.body.getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(reply.status, body.length == 0 ? -1 : body.length);
